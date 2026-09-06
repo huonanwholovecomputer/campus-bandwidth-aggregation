@@ -1,0 +1,10 @@
+# 系统 / 编辑器杂项
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
+
+# 本地草稿与含真实数据的实验记录：一律不要入库
+drafts/
+*.private.*
+*_real_*

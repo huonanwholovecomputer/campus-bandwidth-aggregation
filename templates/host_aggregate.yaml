@@ -1,0 +1,141 @@
+# =============================================================================
+# 模板：宿主侧"聚合代理"配置（mihomo 风格，多出口聚合；脱敏模板）
+#
+# 【用途】
+#   在宿主机（Windows / Linux / macOS）上用 mihomo 把多条网络出口聚合为统一
+#   出口：
+#     · 国内流量按规则进入"多出口负载均衡组"（例如：本机某网卡直连 + 路由器
+#       SOCKS 分桶出口 + 中转机 SOCKS 出口），把多会话带宽合并使用；
+#     · 境外流量走"节点源"（provider 文件）中的节点，节点清单由服务商在本地
+#       下发 / 转换，本模板不包含任何节点地址、端口或凭据；
+#     · 可选 TUN 模式把整机流量"单设备化"接管（Windows 需管理员权限）。
+#   运行：mihomo -d <配置目录> -f <本文件>（mihomo，兼容经典 clash 配置格式）。
+#
+# 【前置条件】
+#   · 装有 mihomo（兼容经典 clash 配置格式，版本 v1.18+ 均可）。
+#   · 各出口管道已就绪：路由器侧已跑起 SOCKS 分桶（见 multipath_setup.sh），
+#     中转机（如有）已跑起 SOCKS 转发服务。
+#   · 开启 TUN 前请先以管理员 / root 运行过一次；冒烟测试可把 tun.enable
+#     先置 false、只走 mixed-port。
+#   · 把下方全部 <> 占位符替换为你的环境值，即为可运行配置。
+#
+# 【占位符清单】
+#   <混合端口>          本地混合端口（HTTP/SOCKS5，如 7890）
+#   <控制API地址>       external-controller 地址（含端口，一般填本机回环）
+#   <DNS监听地址>/<DNS监听端口>  DNS 服务监听地址与端口（一般用通配 + 高位端口）
+#   <DNS_IP>/<备用DNS_IP>        上游 DNS 服务器地址（公共或校网 DNS）
+#   <节点源名>          节点源（provider）的名字
+#   <节点源文件路径>    节点源本地文件路径（相对本配置文件目录）
+#   <健康检查URL>       节点源连通性探测地址（204 探测类）
+#   <健康检查间隔秒>    节点源探测间隔
+#   <节点A-名称>/<节点A-接口名>      直连出口：本机某网卡（会话桶A）
+#   <节点B-服务器地址>/<节点B-端口>  经路由器聚合的 SOCKS5 出口（会话桶B）
+#   <节点C-服务器地址>/<节点C-端口>  经中转机转发的 SOCKS5 出口（可选）
+#   <节点D-名称>/<节点D-类型>/<节点D-服务器地址>/<节点D-端口>/
+#       <节点D-密码>/<节点D-加密方法>  需账号口令的加密节点示例（可选）
+#   <聚合组名>          国内多出口负载均衡策略组名
+#   <境外组名>          境外出口选择策略组名
+#
+# 【风险提示】
+#   · 仅限自有设备 / 自有账号（或已获授权账号）实验；遵守所在网络的接入与
+#     使用规定，留意账号并发会话上限。
+#   · 节点清单与口令请保持在本地；严禁把节点地址、口令或服务商信息提交到
+#     任何公开仓库或模板。
+#   · 负载均衡会让连接分散到不同会话，认证 / 支付等对出口敏感的服务可能被
+#     风控，可把相关域名直连或固定到单条出口。
+#   · TUN 模式运维纪律（实测教训，务必遵守）：
+#      1. 禁用热重载：TUN 运行中通过外部控制器（如 PUT /configs?force=true）
+#         热重载配置会导致进程崩溃、TUN 路由残留 → 全网黑洞；改配置一律
+#         重启进程（systemd 重启 / 手动重启）；
+#      2. 重启必须提权：非管理员（Windows）或非 root 重启后，TUN 创建会被
+#         静默拒绝（tun.enable 实际不生效、虚拟网卡不存在）→ 流量悄悄退回
+#         直连单会话、聚合静默失效且不报错。重启前确认权限，重启后用
+#         external-controller 或系统网卡列表核对 TUN 是否真的接管；
+#      3. 冷启动时序：若上游会话在虚拟机 / 另一台设备上，聚合代理应等上游
+#         端口就绪后再启动，否则 TUN 自动发现接口失败、腿不可用。
+#   · 本模板不含任何真实标识；占位符规范见 docs/00_脱敏与贡献规范.md。
+# =============================================================================
+
+mixed-port: <混合端口>
+allow-lan: true
+mode: rule
+log-level: info
+ipv6: false
+external-controller: "<控制API地址>"
+
+# --- TUN：整机流量接管（冒烟测试可先置 enable: false）---
+tun:
+  enable: true
+  stack: mixed                # Windows: mixed | system | gvisor
+  dns-hijack:
+    - any:53
+  auto-route: true
+  auto-detect-interface: true
+
+# --- DNS：国内解析，防污染 ---
+dns:
+  enable: true
+  listen: "<DNS监听地址>:<DNS监听端口>"
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+  nameserver:
+    - <DNS_IP>
+    - <备用DNS_IP>
+  default-nameserver:
+    - <DNS_IP>
+
+# --- 节点源：provider 文件由服务商下发，本模板不含任何节点地址 / 凭据 ---
+proxy-providers:
+  <节点源名>:
+    type: file
+    path: <节点源文件路径>
+    health-check:
+      enable: true
+      url: "<健康检查URL>"
+      interval: <健康检查间隔秒>
+
+# --- 出口节点：一律占位，替换为你的实际出口；绝不携带真实地址 / 口令 ---
+proxies:
+  - name: "<节点A-名称>"              # 会话桶A：本机某网卡直连
+    type: direct
+    interface-name: "<节点A-接口名>"
+  - name: "<节点B-名称>"              # 会话桶B：路由器 SOCKS 分桶出口
+    type: socks5
+    server: "<节点B-服务器地址>"
+    port: <节点B-端口>
+    udp: true
+  - name: "<节点C-名称>"              # 可选：中转机 SOCKS 出口
+    type: socks5
+    server: "<节点C-服务器地址>"
+    port: <节点C-端口>
+    udp: true
+  # 可选示例：需要账号口令的加密节点；不需要则删除本节
+  - name: "<节点D-名称>"
+    type: <节点D-类型>
+    server: "<节点D-服务器地址>"
+    port: <节点D-端口>
+    cipher: "<节点D-加密方法>"
+    password: "<节点D-密码>"
+
+# --- 策略组 ---
+proxy-groups:
+  - name: "<聚合组名>"
+    type: load-balance
+    strategy: round-robin
+    proxies:
+      - "<节点A-名称>"
+      - "<节点B-名称>"
+      - "<节点C-名称>"
+  - name: "<境外组名>"
+    type: select
+    use:
+      - <节点源名>
+
+# --- 规则 ---
+rules:
+  - GEOIP,private,DIRECT
+  - GEOSITE,cn,<聚合组名>
+  - GEOIP,CN,<聚合组名>
+  - MATCH,<境外组名>
