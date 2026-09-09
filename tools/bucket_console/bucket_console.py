@@ -11,7 +11,7 @@ bucket_console.py — 多桶聚合控制台（多桶合一 · 托盘 + 全操控
   ├ 桶状态表  桶 / 状态 / 真机判定 / 最后IP / 说明（双击看详情，悬停看解读）
   ├ 系统行    聚合出口 + 白名单 + 巡检时间
   ├ 健康走势  本会话每桶状态 step 线（在线 / 劫持·未知 / 丢包 / 离线）
-  ├ 标签页    ①在线会话 ②白名单绑定 ③账号密码 ④真机判定 ⑤运维总控 ⑥事件日志 ⑦自检报告
+  ├ 标签页    在线会话 / 白名单绑定 / 账号密码 / 真机判定 / 桶管理 / 运维总控 / 事件日志 / 自检报告
   ├ 按钮区    刷新/巡检/门户/安全续连/重启聚合/代理开关/日志/复制摘要/自检/测速/目录/帮助/退出
   └ 底栏      门户属主与时间 · 状态文件时间
 
@@ -1275,10 +1275,12 @@ class App:
                      "log", "health"):
             self.tab_index[name] = len(self.nb.tabs())
             self.nb.add(ttk.Frame(self.nb), text=name)
-        self.nb.tab(self.tab_index["accounts"], text="账号密码")
-        self.nb.tab(self.tab_index["ops"], text="运维总控")
-        self.nb.tab(self.tab_index["real"], text="真机判定")
-        self.nb.tab(self.tab_index["manager"], text="桶管理")
+        # 标签标题统一中文（内部键仍是英文，供 tab_index 与事件日志使用）
+        for _name, _title in (("sessions", "在线会话"), ("whitelist", "白名单绑定"),
+                              ("accounts", "账号密码"), ("real", "真机判定"),
+                              ("manager", "桶管理"), ("ops", "运维总控"),
+                              ("log", "事件日志"), ("health", "自检报告")):
+            self.nb.tab(self.tab_index[_name], text=_title)
         self._build_tab_sessions()
         self._build_tab_whitelist()
         self._build_tab_accounts()
