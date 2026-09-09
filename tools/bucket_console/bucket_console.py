@@ -799,13 +799,17 @@ def breaker_buckets(cfg):
             if b.get("enabled", True) and (b["probe"].get("mode") or "local") != "none"]
 
 
-def breaker_round(s, buckets, losses):
+def breaker_round(s, buckets, losses, apply=None):
     """一轮熔断判定（纯逻辑，便于回归测试）。
 
     s       : 配置里的 aggregation.breaker
     buckets : 参与采样的桶（已过滤 enabled / mode=none）
     losses  : {bucket_id: 丢包率% 或 None}
-    返回需要执行的动作 [(bucket, isolate:bool, loss), ...]；运行态写在 _BR 里。
+    apply   : 可选回调 apply(bucket, isolate, loss) -> bool。
+              返回 False（动作没配 / 命令失败）时**不改变已隔离集合**——
+              避免出现「界面显示已隔离、聚合里其实还挂着」的自欺状态。
+              传 None 表示假定成功（纯逻辑测试用）。
+    返回真正做成的动作 [(bucket, isolate:bool, loss), ...]；运行态写在 _BR 里。
     """
     acts = []
     thr = int(s.get("threshold_pct", 50))
@@ -827,11 +831,17 @@ def breaker_round(s, buckets, losses):
         active = len([x for x in buckets if x["id"] not in _BR["tripped"]])
         if (bid not in _BR["tripped"] and _BR["fail"].get(bid, 0) >= trip_n
                 and active > keep_min):
-            _BR["tripped"].add(bid)
-            acts.append((b, True, loss))
+            if apply is None or apply(b, True, loss):
+                _BR["tripped"].add(bid)
+                acts.append((b, True, loss))
+            else:
+                _BR["fail"][bid] = 0      # 摘不动 → 清零，避免每轮重复尝试刷日志
         elif bid in _BR["tripped"] and _BR["ok"].get(bid, 0) >= rec_n:
-            _BR["tripped"].discard(bid)
-            acts.append((b, False, loss))
+            if apply is None or apply(b, False, loss):
+                _BR["tripped"].discard(bid)
+                acts.append((b, False, loss))
+            else:
+                _BR["ok"][bid] = 0
     return acts
 
 
@@ -897,6 +907,14 @@ class BreakerRunner:
         _BR["note"] = "检查中…"
         self._render_async()
 
+        fails = []
+
+        def _apply_rec(bucket, isolate, loss):
+            ok, why = self._apply(bucket, isolate, loss)
+            if not ok:
+                fails.append("%s %s" % (bucket["id"], why))
+            return ok
+
         def work():
             try:
                 tries = int(s.get("tries", 5))
@@ -908,10 +926,13 @@ class BreakerRunner:
                     except Exception:  # noqa: BLE001
                         losses[b["id"]] = None
                     _BR["last"][b["id"]] = losses[b["id"]]
-                acts = breaker_round(s, buckets, losses)
-                for b, isolate, loss in acts:
-                    self._apply(b, isolate=isolate, loss=loss)
-                _BR["note"] = ("本轮隔离/恢复 %d 条" % len(acts)) if acts else "本轮无变更"
+                acts = breaker_round(s, buckets, losses, apply=_apply_rec)
+                parts = []
+                if acts:
+                    parts.append("本轮隔离/恢复 %d 条" % len(acts))
+                if fails:
+                    parts.append("未执行 %d 条（%s）" % (len(fails), "；".join(fails[:2])))
+                _BR["note"] = " · ".join(parts) or "本轮无变更"
             finally:
                 _BR["busy"] = False
                 _BR["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -923,7 +944,11 @@ class BreakerRunner:
         threading.Thread(target=work, daemon=True).start()
 
     def _apply(self, bucket, isolate, loss=None):
-        """执行用户配置的隔离/恢复动作；未配置则只记录状态并在界面提示。"""
+        """执行用户配置的隔离/恢复动作。返回 (是否真的做成, 原因)。
+
+        未配置动作 / 命令非 0 退出 → 返回 False：界面**不会**显示「已隔离」，
+        避免「界面说摘了、聚合里其实还挂着」这种自欺状态。
+        """
         name = "isolate_leg" if isolate else "restore_leg"
         verb = "隔离" if isolate else "恢复"
         bid = bucket["id"]
@@ -932,15 +957,15 @@ class BreakerRunner:
         except Exception:
             pass
         if not self.app.cfg.action(name):
-            _BR["note"] = ("%s %s：未配置 actions.%s，仅记录状态"
-                           % (verb, bid, name))
-            return
+            return False, "未配置 actions.%s" % name
         try:
             rc, out = exec_action(self.app.cfg, name, bucket, loss=str(loss))
-            if rc not in (0, None):
-                _BR["note"] = "%s %s 失败：%s" % (verb, bid, (out or "").splitlines()[-1:])
         except Exception as e:  # noqa: BLE001
-            _BR["note"] = "%s %s 异常：%s" % (verb, bid, e)
+            return False, "异常 %s" % e
+        if rc == 0:
+            return True, ""
+        tail = (out or "").strip().splitlines()[-1:]
+        return False, "rc=%s %s" % (rc, (tail[0][:60] if tail else ""))
 
     def _render_async(self):
         """把渲染投递回主线程（探测/动作都在后台线程里跑）。"""
@@ -3251,7 +3276,9 @@ class App:
             self.ops_br_rows[b["id"]] = (loss, state)
         ttk.Label(fBk, justify="left", foreground="#8d8d8d", wraplength=self.px(900), text=(
             "判定在本控制台，执行完全走配置里的 actions.isolate_leg / restore_leg"
-            "（可用 {bucket} {account} {leg} {loss} 占位符）；未配置则只记录状态并提示。\n"
+            "（可用 {bucket} {account} {leg} {loss} 占位符）。\n"
+            "未配置（或命令执行失败）→ 只采样并提示，**不会**把桶标成「已隔离」，"
+            "界面状态永远与你的聚合出口一致。\n"
             "⚠️ 熔断采样只在「高级界面」运行时进行（简单界面/托盘运行期间不采样）。"
         )).pack(anchor="w", padx=self.px(4), pady=(0, self.px(2)))
         while self._breaker_render in _BR_RENDER_CBS:
@@ -3339,18 +3366,23 @@ class App:
             return
         if not self.cfg.action(name):
             messagebox.showinfo(verb, "未配置 actions.%s —— 请在配置里填一条命令\n"
-                                      "（可用 {bucket} {account} {leg} {loss} 占位符）。" % name)
+                                      "（可用 {bucket} {account} {leg} {loss} 占位符）。\n\n"
+                                      "在配好之前，熔断只做采样与提示，不会摘腿，"
+                                      "也不会把该桶标成「已隔离」。" % name)
             return
 
         def work():
-            rc, out = exec_action(self.cfg, name, bucket, loss="manual")
-            if isolate:
-                _BR["tripped"].add(bucket["id"])
+            ok, why = self.breaker_runner._apply(bucket, isolate, "manual")
+            if ok:
+                if isolate:
+                    _BR["tripped"].add(bucket["id"])
+                else:
+                    _BR["tripped"].discard(bucket["id"])
+                _BR["fail"][bucket["id"]] = 0
+                _BR["ok"][bucket["id"]] = 0
+                _BR["note"] = "手动%s %s 成功" % (verb, bucket["id"])
             else:
-                _BR["tripped"].discard(bucket["id"])
-            _BR["fail"][bucket["id"]] = 0
-            _BR["ok"][bucket["id"]] = 0
-            _BR["note"] = "手动%s %s → rc=%s" % (verb, bucket["id"], rc)
+                _BR["note"] = "手动%s %s 失败：%s" % (verb, bucket["id"], why)
             breaker_save(self.cfg)
             self._render_async()
         self._log_bind("breaker: 手动%s %s" % (verb, bucket["id"]))

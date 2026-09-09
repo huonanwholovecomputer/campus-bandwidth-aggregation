@@ -224,6 +224,13 @@ try:
     _a8 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 0})
     _a9 = bc.breaker_round(brs, _bs, {"A": 90, "B": 0, "C": 0})
     check("抖动回落会清零计数（不累计误隔离）", _a8 == [] and _a9 == [], (_a8, _a9))
+    _br_reset()
+    _a10 = bc.breaker_round(brs, _bs, {"A": 80, "B": 0, "C": 0}, apply=lambda *a: False)
+    _a11 = bc.breaker_round(brs, _bs, {"A": 80, "B": 0, "C": 0}, apply=lambda *a: False)
+    check("动作未配置/失败 → 不标记已隔离且计数清零",
+          _a10 == [] and _a11 == [] and bc._BR["tripped"] == set()
+          and bc._BR["fail"].get("A", 0) == 0,
+          (_a10, _a11, bc._BR["tripped"], bc._BR["fail"]))
     # 采样范围：停用桶 / mode=none 不参与
     _db = tempfile.mkdtemp(prefix="bc_p10_")
     with open(os.path.join(os.path.dirname(HERE), "config.example.json"),

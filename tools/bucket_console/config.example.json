@@ -73,7 +73,7 @@
     "dir": "<聚合出口配置目录>",
 
     "breaker": {
-      "_note": "分流熔断：控制台按桶采样丢包率，连续超阈值的腿自动隔离、连续达标自动恢复。enabled=false 则完全不采样。执行动作见 actions.isolate_leg / restore_leg（未配置时只记录状态并提示）",
+      "_note": "分流熔断：控制台按桶采样丢包率，连续超阈值的腿自动隔离、连续达标自动恢复。enabled=false 则完全不采样。摘腿/放腿由 actions.isolate_leg / restore_leg 执行；未配置时只采样并提示，不会标记为已隔离",
       "enabled": true,
       "threshold_pct": 50,
       "trip_after": 2,
