@@ -228,6 +228,13 @@ try:
                          encoding="utf-8"))["excluded"] == ["B-socks", "C-eth3"])
     shutil.rmtree(tmp3, ignore_errors=True)
 
+    tmp4 = tempfile.mkdtemp(prefix="bc_legs4_")
+    cfgp4, pf4, full4 = build_env(tmp4, api="")
+    rc = run(cfgp4, "off", "--leg", "B-socks")
+    check("未配置热更新入口 → 跳过热更新但算成功（退出码 0）", rc == 0, rc)
+    check("未配置热更新时文件仍已更新", "B-socks" not in read(pf4))
+    shutil.rmtree(tmp4, ignore_errors=True)
+
     print("\n== CLI 冒烟 ==")
     import subprocess
     p = subprocess.run([sys.executable, os.path.join(ROOT, "leg_ctl.py"),

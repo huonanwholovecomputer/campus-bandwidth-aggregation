@@ -238,14 +238,18 @@ def read_full(cfg) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 # 热更新
 # --------------------------------------------------------------------------
-def provider_put(cfg, text: str, dry: bool = False) -> tuple[bool, str]:
-    """把腿列表热更新到聚合出口（mihomo：PUT /providers/proxies/<名>）。"""
+def provider_put(cfg, text: str, dry: bool = False) -> tuple[bool | None, str]:
+    """把腿列表热更新到聚合出口（mihomo：PUT /providers/proxies/<名>）。
+
+    返回 (状态, 说明)：True 成功 / False 失败 / None 跳过（未配置或 dry-run）。
+    跳过不算失败 —— 只维护文件、靠重启或下次刷新生效也是合法用法。
+    """
     lg = cfg.aggregation["legs"]
     api, name = lg["api"], lg["provider_name"]
     if dry:
-        return True, "（dry-run 未热更新）"
+        return None, "（dry-run 未热更新）"
     if not api or not name:
-        return False, "未配置 aggregation.legs.api / provider_name，跳过热更新"
+        return None, "未配置 aggregation.legs.api / provider_name —— 跳过热更新（文件已更新）"
     url = "%s/providers/proxies/%s" % (api.rstrip("/"), name)
     try:
         req = urllib.request.Request(url, data=text.encode("utf-8"), method="PUT",
@@ -315,7 +319,7 @@ def apply_exclusions(cfg, excluded, dry=False, reload=True, quiet=False,
     if reload:
         ok2, msg2 = provider_put(cfg, text, dry)
         print("  热更新：%s" % msg2)
-        if not ok2:
+        if ok2 is False:
             print("  ↳ 文件已写好，但热更新没成功：重启聚合出口（或下次刷新 provider）后即生效",
                   file=sys.stderr)
             return RC_RELOAD
