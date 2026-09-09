@@ -42,7 +42,8 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from console_config import ConfigError, load_config, default_config_path  # noqa: E402
+from console_config import (ConfigError, default_config_path,  # noqa: E402
+                            load_config, safe_console)
 
 RC_OK, RC_CFG, RC_LEGS, RC_KEEP, RC_RELOAD = 0, 2, 3, 4, 5
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -416,6 +417,7 @@ def cmd_status(cfg) -> int:
 
 
 def main(argv=None) -> int:
+    safe_console()   # 中文/非 UTF-8 控制台下中文与符号输出不崩（与其它入口一致）
     ap = argparse.ArgumentParser(description="聚合腿列表维护（分流熔断的摘腿/放腿实现）")
     ap.add_argument("--config", "-c", default=None, help="配置文件路径（默认自动查找）")
     ap.add_argument("--dry-run", action="store_true", help="只打印将要发生的变化，不落盘")

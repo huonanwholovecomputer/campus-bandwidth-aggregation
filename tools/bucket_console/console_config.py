@@ -24,6 +24,22 @@ import json
 import os
 import re
 import shlex
+import sys
+
+
+def safe_console():
+    """控制台代码页可能不是 UTF-8：把不可编码字符降级为 '?'，避免直接崩掉。
+
+    否则 `--check` 在中文 Windows 控制台会因打印 '✓' 抛 UnicodeEncodeError。
+    （2026-09-09 由内部测试版回灌到 bucket_console.py；此处提为共享实现，
+    probe_buckets.py / leg_ctl.py 等独立入口一并调用。）
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(errors="replace")   # type: ignore[attr-defined]
+        except Exception:
+            pass
+
 
 _PLACEHOLDER_RE = re.compile(r"<[^<>]{1,60}>")
 

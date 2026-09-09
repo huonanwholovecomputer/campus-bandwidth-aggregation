@@ -51,8 +51,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from console_config import (  # noqa: E402
     BUCKET_KINDS, ConfigError, PROBE_MODES, RENEW_MODES, config_summary,
     default_config_path, is_unset, load_config, mac_is_multicast, mac_ok,
-    new_bucket_template, normalize_mac, save_buckets, save_config_keys,
-    validate_bucket,
+    new_bucket_template, normalize_mac, safe_console, save_buckets,
+    save_config_keys, validate_bucket,
 )
 
 try:
@@ -4709,16 +4709,12 @@ def build_simple_tray(app, root, cfg):
 
 
 def _safe_console():
-    """控制台可能是 GBK 代码页：把不可编码字符降级为 '?'。
+    """控制台可能是 GBK 代码页：把不可编码字符降级为 '?'（实现见 console_config.safe_console）。
 
     否则 `--check` 在中文 Windows 控制台会因打印 '✓' 直接 UnicodeEncodeError 崩掉
-    （2026-09-09 由内部测试版回灌）。
+    （2026-09-09 由内部测试版回灌；现与 probe_buckets.py / leg_ctl.py 共用同一份实现）。
     """
-    for s in (sys.stdout, sys.stderr):
-        try:
-            s.reconfigure(errors="replace")   # type: ignore[attr-defined]
-        except Exception:
-            pass
+    safe_console()
 
 
 def main(argv=None):

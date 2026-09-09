@@ -34,7 +34,8 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from console_config import ConfigError, load_config, default_config_path, is_unset  # noqa: E402
+from console_config import (ConfigError, default_config_path,  # noqa: E402
+                            is_unset, load_config, safe_console)
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 DEVNULL = os.devnull
@@ -281,6 +282,7 @@ def probe_all(cfg, only=None):
 
 
 def main(argv=None):
+    safe_console()   # 中文 Windows 控制台（GBK）下 --check 的 '✓' 会 UnicodeEncodeError
     ap = argparse.ArgumentParser(description="多桶聚合控制台 · 参考状态生产端")
     ap.add_argument("--config", "-c", default=None, help="配置文件路径（默认自动查找）")
     ap.add_argument("--only", action="append", default=[], help="只探测指定桶 id（可重复）")
