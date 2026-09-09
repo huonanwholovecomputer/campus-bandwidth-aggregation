@@ -35,6 +35,7 @@ import csv
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -201,19 +202,100 @@ def file_age_min(path):
         return None
 
 
+# ---------------- 界面状态持久化（几何/刷新间隔/标签页） ----------------
+# 2026-09-09 由内部测试版回灌：开源版此前只从 ui.window_w/h 取固定初值，
+# 窗口挪动/改刷新间隔/切标签页在重启后全部丢失。
+def _ui_state_file(cfg):
+    return os.path.join(cfg.data_dir, "ui_state.json")
+
+
+def load_ui_state(cfg):
+    """读界面状态；文件缺失/损坏返回 {}（不抛）。"""
+    d = load_json(_ui_state_file(cfg)) or {}
+    return d if isinstance(d, dict) else {}
+
+
+def save_ui_state(cfg, **kw):
+    """合并写入界面状态（原子写）。删除该文件即恢复默认布局。"""
+    d = load_ui_state(cfg)
+    d.update({k: v for k, v in kw.items() if v is not None})
+    d["_note"] = "界面状态（窗口几何/刷新间隔/标签页），自动维护；删除即恢复默认"
+    path = _ui_state_file(cfg)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+        return False
+
+
+def parse_geometry(geo):
+    """'1000x860+120+80' -> (w, h, x, y)；不合法返回 None。"""
+    m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", str(geo or ""))
+    if not m:
+        return None
+    try:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+    except Exception:
+        return None
+
+
+def _decode_console(b):
+    """子进程输出解码：UTF-8 → CP936 → Latin-1 依次尝试。
+
+    schtasks 的状态文本会随控制台代码页在 "Ready" 与「准备就绪」之间变化，
+    固定 utf-8 解码会得到 U+FFFD 乱码（2026-09-09 由内部测试版回灌）。
+    """
+    for enc in ("utf-8", "cp936", "latin-1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", "replace")
+
+
+# schtasks 状态文本本地化差异 → 统一成英文规范值（界面按英文值判色）
+_TASK_STATE_MAP = {
+    "ready": "Ready", "就绪": "Ready", "准备就绪": "Ready",
+    "running": "Running", "正在运行": "Running", "运行中": "Running",
+    "disabled": "Disabled", "已禁用": "Disabled", "禁用": "Disabled",
+    "queued": "Queued", "已排队": "Queued",
+}
+
+
 def task_state(name):
-    """schtasks 查询（Windows）；其它平台返回「不适用」。"""
+    """schtasks 查询（Windows）；其它平台返回「不适用」。
+
+    实测格式（本机）：`"\\WeNetState","2026/9/9 20:25:00","Ready"` —— **3 列**。
+    旧实现按 4 列解析（row[1] 当任务名、row[3] 当状态），`/TN` 查询只有 3 列，
+    于是 len(row) >= 4 恒为假 → 所有任务都显示「未知」（2026-09-09 由内部测试版回灌）。
+    """
     if not IS_WIN:
         return "不适用"
     try:
         r = subprocess.run(["schtasks.exe", "/Query", "/TN", name, "/FO", "CSV", "/NH"],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=15, creationflags=NO_WINDOW)
+                           capture_output=True, timeout=15, creationflags=NO_WINDOW)
         if r.returncode != 0:
             return "不存在"
-        for row in csv.reader(r.stdout.splitlines()):
-            if len(row) >= 4 and row[1].strip("\\ ").split("\\")[-1].lower() == name.lower():
-                return row[3]
+        txt = _decode_console(r.stdout or b"")
+        for row in csv.reader(txt.splitlines()):
+            if len(row) < 3:
+                continue
+            nm = row[0].strip("\\ ").split("\\")[-1]
+            if nm.lower() == name.lower():
+                raw = row[2].strip()
+                return _TASK_STATE_MAP.get(raw.lower(), raw or "未知")
         return "未知"
     except Exception as e:  # noqa: BLE001
         return "ERR %s" % e
@@ -282,8 +364,18 @@ def set_proxy_mode(cfg, target, log=None):
         return False, "聚合控制面不可达，无法切换"
     log("proxy-toggle 目标=%s (当前=%s)" % (target, cur))
     try:
-        with open(cfg.aggregation["mode_file"], "w", encoding="ascii") as f:
+        # 原子写（2026-09-09 由内部测试版回灌）：控制台每 15s 读模式文件判定代理态，
+        # 先截断再写会让读方拿到半截内容。
+        _mf = cfg.aggregation["mode_file"]
+        _tmp = _mf + ".tmp"
+        _dir = os.path.dirname(_mf)
+        if _dir:
+            os.makedirs(_dir, exist_ok=True)
+        with open(_tmp, "w", encoding="ascii") as f:
             f.write(target + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, _mf)
     except Exception as e:  # noqa: BLE001
         return False, "写模式文件失败：%s" % e
     exec_action(cfg, cfg.aggregation.get("restart_action") or "restart_aggregator")
@@ -424,6 +516,170 @@ class ToolTip:
             pass
 
 
+# ---------------- 配置编辑对话框（P9 · 2026-09-09 由内部测试版回灌） ----------------
+# 只编辑「标量键」：app/ui/probe/aggregation/portal/vm；
+# 桶走「桶管理」页，actions 是命令清单（结构复杂），建议直接改配置文件。
+_CONFIG_TABS = [
+    ("应用/界面", [
+        ("app.data_dir", "数据目录", "path", "状态/事件/心跳落盘位置（改后需重启）"),
+        ("ui.title", "窗口标题", "text", ""),
+        ("ui.tray_title", "托盘标题", "text", ""),
+        ("ui.interval_ms", "刷新间隔(ms)", "int", "15000 / 30000 / 60000"),
+        ("ui.window_w", "窗口宽", "int", "逻辑像素"),
+        ("ui.window_h", "窗口高", "int", "逻辑像素"),
+        ("ui.spark_samples", "走势采样数", "int", ""),
+    ]),
+    ("探活", [
+        ("probe.target", "204 判据 URL", "url", "HTTP 204 = 在线"),
+        ("probe.curl", "curl 可执行名", "text", ""),
+        ("probe.icmp", "启用 ICMP 丢包", "bool", ""),
+        ("probe.icmp_count", "ICMP 次数", "int", ""),
+        ("probe.ping_host", "ICMP 目标", "text", "留空 = 取探活地址主机名"),
+    ]),
+    ("聚合控制面", [
+        ("aggregation.api", "控制 API", "url", "留空 = 不做腿组探测"),
+        ("aggregation.group", "聚合组名", "text", ""),
+        ("aggregation.provider", "提供器名", "text", ""),
+        ("aggregation.provider_url", "节点源地址", "text", "含凭据时勿外泄"),
+        ("aggregation.mode_file", "模式文件", "path", ""),
+        ("aggregation.restart_action", "重启动作名", "text", "对应 actions 里的键"),
+        ("aggregation.proxy_enabled", "启用代理开关", "bool", ""),
+    ]),
+    ("门户", [
+        ("portal.global_tok_file", "全局凭据文件", "path", ""),
+        ("portal.per_account_pattern", "每账号凭据模板", "text", "如 portal_tok_{account}.txt"),
+        ("portal.tok_dir", "凭据目录", "path", ""),
+        ("portal.owner_field", "属主字段", "text", "门户产物里表示凭据属主的键"),
+        ("portal.max_age_min", "判定最大陈旧(分钟)", "int", "真机闸超过该值按「无法验证」拦截"),
+    ]),
+    ("虚拟路由", [
+        ("vm.enabled", "启用", "bool", "关闭时「运维总控」不显示该区块"),
+        ("vm.label", "显示名", "text", ""),
+        ("vm.note", "备注", "text", ""),
+    ]),
+]
+
+
+def _cfg_get(raw, path):
+    cur = raw
+    for seg in str(path).split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(seg)
+    return cur
+
+
+class _ConfigDialog:
+    """schema 驱动的配置编辑器：备份 + 原子写回（save_config_keys）+ 就地热更新。"""
+
+    def __init__(self, app):
+        self.app = app
+        self.root = app.root
+        self.px = app.px
+        self.vars = {}
+        top = tk.Toplevel(self.root)
+        self.top = top
+        top.title("配置 · %s" % os.path.basename(app.cfg.path))
+        top.geometry("%dx%d" % (self.px(780), self.px(560)))
+        top.minsize(self.px(620), self.px(420))
+        top.transient(self.root)
+        outer = ttk.Frame(top, padding=self.px(8))
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, foreground="#555", justify="left", wraplength=self.px(740),
+                  text="只编辑标量配置；桶请到「桶管理」页，命令清单（actions）请直接改配置文件。"
+                       "保存会先备份 *.bak-<时间戳> 再原子写回。").pack(anchor="w",
+                                                                   pady=(0, self.px(4)))
+        nb = ttk.Notebook(outer)
+        nb.pack(fill="both", expand=True)
+        raw = app.cfg.raw
+        for title, fields in _CONFIG_TABS:
+            frm = ttk.Frame(nb)
+            nb.add(frm, text=title)
+            wrap = ttk.Frame(frm, padding=self.px(8))
+            wrap.pack(fill="both", expand=True)
+            wrap.columnconfigure(1, weight=1)
+            for i, (key, label, kind, hint) in enumerate(fields):
+                ttk.Label(wrap, text=label, anchor="w").grid(
+                    row=i, column=0, sticky="w", pady=self.px(3), padx=(0, self.px(6)))
+                cur = _cfg_get(raw, key)
+                if kind == "bool":
+                    var = tk.BooleanVar(value=bool(cur))
+                else:
+                    var = tk.StringVar(value="" if cur is None else str(cur))
+                self.vars[key] = (var, kind)
+                if kind == "bool":
+                    ttk.Checkbutton(wrap, variable=var).grid(row=i, column=1, sticky="w")
+                else:
+                    ttk.Entry(wrap, textvariable=var, width=40).grid(row=i, column=1,
+                                                                    sticky="we")
+                if hint:
+                    ttk.Label(wrap, text=hint, foreground="#888").grid(
+                        row=i, column=2, sticky="w", padx=(self.px(8), 0))
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(self.px(6), 0))
+        ttk.Button(bar, text="打开配置文件", width=13, command=self._open_raw).pack(side="left")
+        ttk.Button(bar, text="保存", width=10, command=self._save).pack(side="right")
+        ttk.Button(bar, text="关闭", width=8, command=self._close).pack(
+            side="right", padx=(0, self.px(6)))
+        top.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _open_raw(self):
+        if not open_path(self.app.cfg.path):
+            messagebox.showerror("配置", "打不开: %s" % self.app.cfg.path)
+
+    def _close(self):
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+    def _save(self):
+        updates, errs = {}, []
+        for key, (var, kind) in self.vars.items():
+            if kind == "bool":
+                updates[key] = bool(var.get())
+                continue
+            s = str(var.get()).strip()
+            # 空值 / 仍是 <占位符> -> 不改动该项（避免把占位符写进配置，也避免强迫用户填满）
+            if is_unset(s):
+                continue
+            if kind == "int":
+                if not s.isdigit():
+                    errs.append("「%s」必须是数字：%r" % (key, s))
+                    continue
+                updates[key] = int(s)
+            elif kind == "url":
+                if not (s.startswith("http://") or s.startswith("https://")):
+                    errs.append("「%s」必须是 http(s) URL：%r" % (key, s))
+                    continue
+                updates[key] = s
+            else:
+                updates[key] = s
+        if errs:
+            messagebox.showerror("配置", "\n".join(errs))
+            return
+        if not updates:
+            messagebox.showinfo("配置", "没有可保存的改动（留空 / 占位符 = 不修改该项）。")
+            return
+        try:
+            backup = save_config_keys(self.app.cfg, updates)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("配置", "保存失败：%s" % e)
+            return
+        live, restart = self.app.reload_config()
+        messagebox.showinfo(
+            "配置",
+            "已写回 %s\n备份：%s\n\n即时生效 %d 项；需重启控制台 %d 项"
+            "（数据目录 / 窗口尺寸 / 刷新间隔 / 凭据路径等）。"
+            % (os.path.basename(self.app.cfg.path), backup, live, restart))
+        self._close()
+
+
+def open_config_dialog(app):
+    """打开配置编辑对话框（模块级入口，便于复用与测试）。"""
+    return _ConfigDialog(app)
+
+
 # ---------------- 主界面（高级） ----------------
 class App:
     def __init__(self, root, cfg, auto_boot=True):
@@ -476,6 +732,18 @@ class App:
         H = min(int(cfg.ui["window_h"] * self.scale), int(sh * 0.92))
         x = max(0, (sw - W) // 2)
         y = max(0, (sh - H) // 3)
+        # 界面状态持久化（2026-09-09 由内部测试版回灌）：几何/间隔/标签页
+        self._ui_saved = load_ui_state(cfg)
+        self._geo_after = None
+        _g = parse_geometry(self._ui_saved.get("geometry"))
+        if _g:
+            gw, gh, gx, gy = _g
+            if gw >= self.px(620) and gh >= self.px(520) and gx >= 0 and gy >= 0 \
+                    and gx + 200 <= sw and gy + 100 <= sh:
+                W, H, x, y = gw, gh, gx, gy
+        _iv = self._ui_saved.get("interval_ms")
+        if isinstance(_iv, int) and _iv in (0, 15000, 30000, 60000):
+            self.interval_ms = _iv
         root.geometry("%dx%d+%d+%d" % (W, H, x, y))
         root.minsize(self.px(620), self.px(520))
         root.resizable(True, True)
@@ -493,8 +761,34 @@ class App:
         self._build_ui()
         self.refresh()
         self._schedule()
+        # 标签页切换即记状态；启动时还原上次停留的页
+        try:
+            self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._save_ui_state())
+            _tab = self._ui_saved.get("tab")
+            if isinstance(_tab, int) and 0 <= _tab < len(self.nb.tabs()):
+                self.nb.select(_tab)
+        except Exception:
+            pass
         if auto_boot and cfg.has_action("boot_chain"):
             self.root.after(int(cfg.lifecycle.get("boot_delay_ms") or 3000), self._boot_chain)
+
+    # ================= 界面状态持久化 =================
+    def _ui_state_file(self):
+        return os.path.join(self.cfg.data_dir, "ui_state.json")
+
+    def _save_ui_state(self):
+        """窗口几何/刷新间隔/标签页写盘（原子写，失败静默）。"""
+        d = {"interval_ms": self.interval_ms}
+        try:
+            d["geometry"] = self.root.geometry()
+        except Exception:
+            pass
+        try:
+            d["tab"] = int(self.nb.index(self.nb.select()))
+        except Exception:
+            pass
+        if save_ui_state(self.cfg, **d):
+            self._ui_saved.update(d)
 
     # ================= 生命周期 =================
     def _log_bind(self, msg):
@@ -543,6 +837,10 @@ class App:
 
     def _final_quit(self):
         try:
+            self._save_ui_state()          # 退出前落盘界面状态
+        except Exception:
+            pass
+        try:
             if self._icon is not None:
                 self._icon.stop()
         except Exception:
@@ -561,6 +859,16 @@ class App:
         if abs(dpi - self._last_dpi) >= 2:
             self._last_dpi = dpi
             self.apply_dpi(dpi)
+        # 几何变化去抖保存（拖动窗口时 <Configure> 高频触发）
+        if getattr(self, "_geo_after", None):
+            try:
+                self.root.after_cancel(self._geo_after)
+            except Exception:
+                pass
+        try:
+            self._geo_after = self.root.after(1200, self._save_ui_state)
+        except Exception:
+            self._geo_after = None
 
     def apply_dpi(self, dpi):
         """窗口跨到不同 DPI 显示器时动态重算（字体由 tk scaling 自动跟随）。"""
@@ -631,6 +939,7 @@ class App:
             ("自检", self.act_health),
             ("测速", self.act_speedtest),
             ("打开数据目录", self.act_open_dir),
+            ("配置", self.act_config),
             ("帮助/图例", self.act_help),
             ("退出(全链停)", self.act_quit),
         ]
@@ -842,16 +1151,51 @@ class App:
                                       font=("TkDefaultFont", 8))
         self.lbl_acct_info.pack(fill="x", padx=self.px(4), pady=(0, self.px(2)))
 
+    # ---------------- 表格重建时保持选中/滚动 ----------------
+    @staticmethod
+    def _tv_state(tree):
+        """快照 Treeview 选中项与 yview（重建前调用）。
+
+        每 15s 的 refresh() 会 delete 全部行再重插，Tk 会丢掉选中与滚动位置 ——
+        表现为「正在看的行每 15 秒被清一次」（2026-09-09 由内部测试版回灌）。
+        """
+        try:
+            return (tuple(tree.selection()), tuple(tree.yview()))
+        except Exception:
+            return ((), None)
+
+    @staticmethod
+    def _tv_restore(tree, state):
+        """还原选中项与滚动位置（重建后调用）；行已消失时静默跳过。"""
+        try:
+            sel, yv = state
+        except Exception:
+            return
+        try:
+            for iid in sel:
+                if tree.exists(iid):
+                    tree.selection_add(iid)
+        except Exception:
+            pass
+        try:
+            if yv:
+                tree.yview_moveto(yv[0])
+        except Exception:
+            pass
+
     def _fill_accounts(self):
         tr = self.tree_acct
+        _st = self._tv_state(tr)
         for row in tr.get_children():
             tr.delete(row)
         if credstore is None:
+            self._tv_restore(tr, _st)
             return
         try:
             rows = credstore.list_accounts()
         except Exception as e:  # noqa: BLE001
             self.lbl_acct_info.config(text="读取凭据库失败: %s" % e, fg="#c62828")
+            self._tv_restore(tr, _st)
             return
         for it in rows:
             has = bool(it["has"])
@@ -860,6 +1204,7 @@ class App:
                               STARS if has else "未配置",
                               it["created"] or "—", it["updated"] or "—"),
                       tags=("locked",) if has else ("nopw",))
+        self._tv_restore(tr, _st)
         self._on_acct_select()
 
     def _account_owner_text(self, acct):
@@ -1188,6 +1533,7 @@ class App:
         self.interval_ms = {"15 秒": 15000, "30 秒": 30000, "60 秒": 60000,
                             "停": 0}.get(self.var_interval.get(), 15000)
         self._schedule()
+        self._save_ui_state()          # 记住刷新间隔
 
     # ================= 状态刷新 =================
     def refresh(self):
@@ -1609,10 +1955,12 @@ class App:
     # ================= 标签页填充 =================
     def _fill_sessions(self, pv):
         tr = self.tree_sessions
+        _st = self._tv_state(tr)
         for row in tr.get_children():
             tr.delete(row)
         if not pv:
             tr.insert("", "end", values=("无门户数据", "", "", "", ""))
+            self._tv_restore(tr, _st)
             return
         seen = set()
         owner = pv.get(self.cfg.portal["owner_field"]) or "?"
@@ -1624,9 +1972,11 @@ class App:
                 seen.add(mac)
                 tr.insert("", "end", values=(mac, s.get("ip") or "—", s.get("os") or "—",
                                              s.get("sid") or "—", owner))
+        self._tv_restore(tr, _st)
 
     def _fill_whitelist(self, pv):
         tr = self.tree_wl
+        _st = self._tv_state(tr)
         for row in tr.get_children():
             tr.delete(row)
         pwset = set()
@@ -1639,6 +1989,7 @@ class App:
                 pass
         if not pv:
             tr.insert("", "end", values=("无门户数据", "", "", "", ""))
+            self._tv_restore(tr, _st)
             return
         clone_macs = {str(b.get("mac") or "").lower() for b in self.cfg.buckets
                       if b["kind"] == "clone" and b.get("mac")}
@@ -1650,13 +2001,16 @@ class App:
                 tr.insert("", "end", values=(a.get("username"), marker, mac,
                                              e.get("os") or "—", e.get("ip") or "—"),
                           tags=(tag,) if tag else ())
+        self._tv_restore(tr, _st)
 
     def _fill_real(self, pv):
         tr = self.tree_real
+        _st = self._tv_state(tr)
         for row in tr.get_children():
             tr.delete(row)
         if not pv:
             tr.insert("", "end", values=("—", "—", "—", "—", "—", "无门户数据"))
+            self._tv_restore(tr, _st)
             return
         for t in (pv.get("cloneTargets") or []):
             rl = t.get("realOnline")
@@ -1670,6 +2024,7 @@ class App:
             tr.insert("", "end", values=(t.get("id"), t.get("account"), real, wl,
                                          t.get("lastIP") or "—", t.get("advice") or ""),
                       tags=(tag,))
+        self._tv_restore(tr, _st)
 
     def _on_real_select(self, _e):
         sel = self.tree_real.selection()
@@ -2333,6 +2688,7 @@ class App:
         self._ops_scroll.pack(side="left", fill="both", expand=True)
         self.ops_inner = inner
         self.ops_task_state = {}
+        self._task_btns = {}
         self.ops_bucket_state = {}
 
         def sec(text):
@@ -2427,13 +2783,14 @@ class App:
                 lbl.pack(side="left")
                 ttk.Label(rowT, text=t["desc"], anchor="w").pack(side="left", fill="x",
                                                                 expand=True)
-                ttk.Button(rowT, text="立即运行", width=8,
-                           command=lambda x=t["name"]: self._act_task_run(x)
-                           ).pack(side="right", padx=self.px(1))
-                ttk.Button(rowT, text="启停", width=6,
-                           command=lambda x=t["name"]: self._act_task_toggle(x)
-                           ).pack(side="right", padx=self.px(1))
+                _b_run = ttk.Button(rowT, text="立即运行", width=8,
+                                    command=lambda x=t["name"]: self._act_task_run(x))
+                _b_run.pack(side="right", padx=self.px(1))
+                _b_tog = ttk.Button(rowT, text="启停", width=6,
+                                    command=lambda x=t["name"]: self._act_task_toggle(x))
+                _b_tog.pack(side="right", padx=self.px(1))
                 self.ops_task_state[t["name"]] = lbl
+                self._task_btns[t["name"]] = (_b_run, _b_tog)
 
         # ⑤ 门户凭据
         fF = sec("⑤ 门户凭据（真机判定可见性 · 会话查询只认凭据属主）")
@@ -2670,12 +3027,26 @@ class App:
         self._run_bg(f)
 
     def _real_gate(self, bucket):
-        """真机闸：刷新门户后判定。返回 (ok, reason)。"""
+        """真机闸：刷新门户后判定。返回 (ok, reason)。
+
+        新鲜度闸（2026-09-09 由内部测试版回灌，fail-closed）：刷新动作失败时门户产物
+        会保留上一次内容，旧数据里的 realOnline=false 会让闸直接放行 —— 相当于
+        拿过期判定去踢人。故先校验产物文件 mtime，过期一律按「无法验证」拦截。
+        """
         rc, out = self._run_action("refresh_portal")
         pv = load_json(self.cfg.portal_file) if self.cfg.portal_file else None
         label = bucket["clone"].get("owner_label") or bucket["account"] or bucket["id"]
         if not pv:
             return False, "门户数据不可读，已取消"
+        try:
+            max_age = float((self.cfg.raw.get("portal") or {}).get("max_age_min") or 3)
+        except Exception:
+            max_age = 3.0
+        age = file_age_min(self.cfg.portal_file)
+        if age is None or age > max_age:
+            return False, ("门户判定数据已过期（%s，阈值 %.0f 分钟）：刷新动作可能失败。"
+                           "按纪律拦截；请先手动刷新门户确认。"
+                           % ("读取失败" if age is None else "%.1f 分钟前" % age, max_age))
         t = self._clone_target(bucket, pv)
         if t is None:
             return False, "无该账号的判定数据（缺其专属凭据？）。按互顶纪律拦截。"
@@ -2768,17 +3139,36 @@ class App:
         self._run_bg(f)
 
     # ---------------- 计划任务 ----------------
+    def _btn_busy(self, btn, busy, busy_text="…"):
+        """按钮忙碌态：禁用 + 临时改文字，避免连点重复触发（2026-09-09 由内部测试版回灌）。"""
+        if btn is None:
+            return
+        try:
+            if busy:
+                if not hasattr(btn, "_idle_text"):
+                    btn._idle_text = btn.cget("text")
+                btn.config(text=busy_text, state="disabled")
+            else:
+                btn.config(text=getattr(btn, "_idle_text", btn.cget("text")),
+                           state="!disabled")
+        except Exception:
+            pass
+
     def _act_task_run(self, tn):
         if not IS_WIN:
             messagebox.showinfo("计划任务", "当前平台不是 Windows，请在配置里改用动作命令。")
             return
+        btn = (getattr(self, "_task_btns", {}) or {}).get(tn, (None, None))[0]
+        self._btn_busy(btn, True, "运行中…")
+
+        def done(rc, out):
+            self._btn_busy(btn, False)
+            msg = "已触发。" if rc == 0 else (out or "失败 rc=%s（需要管理员/任务不存在？）" % rc)
+            messagebox.showinfo("任务 %s" % tn, "%s\n%s" % (msg, out) if rc != 0 else msg)
 
         def f():
             rc, out = run(["schtasks.exe", "/Run", "/TN", tn], timeout=20)
-            msg = "已触发。" if rc == 0 else (out or "失败 rc=%s（需要管理员/任务不存在？）" % rc)
-            self.root.after(0, lambda: messagebox.showinfo("任务 %s" % tn,
-                                                           "%s\n%s" % (msg, out)
-                                                           if rc != 0 else msg))
+            self.root.after(0, lambda: done(rc, out))
         self._run_bg(f)
 
     def _act_task_toggle(self, tn):
@@ -2793,14 +3183,20 @@ class App:
         verb = "停用" if want_disable else "启用"
         if not messagebox.askyesno("%s任务" % verb, "%s：当前状态 %s。确认%s？" % (tn, state, verb)):
             return
+        btn = (getattr(self, "_task_btns", {}) or {}).get(tn, (None, None))[1]
+        self._btn_busy(btn, True, "处理中…")
 
         def f():
             rc, out = run(["schtasks.exe", "/Change", "/TN", tn,
                            "/DISABLE" if want_disable else "/ENABLE"], timeout=20)
             msg = "已%s。" % verb if rc == 0 else (out or "失败 rc=%s（权限不足："
                                                   "请以管理员身份运行本控制台）" % rc)
-            self.root.after(0, lambda: messagebox.showinfo("%s任务 %s" % (verb, tn), msg))
-            self.root.after(0, self._fill_ops)
+
+            def done():
+                self._btn_busy(btn, False)
+                messagebox.showinfo("%s任务 %s" % (verb, tn), msg)
+                self._fill_ops()
+            self.root.after(0, done)
         self._run_bg(f)
 
     # ---------------- 门户凭据管理 ----------------
@@ -3043,6 +3439,56 @@ class App:
         if not open_path(self.cfg.data_dir):
             messagebox.showerror("打开数据目录", "打不开: %s" % self.cfg.data_dir)
 
+    def act_config(self):
+        """打开配置编辑对话框（P9）。"""
+        try:
+            open_config_dialog(self)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("配置", "打开失败: %s" % e)
+
+    def reload_config(self):
+        """保存配置后就地热更新（不重建窗口）。返回 (即时生效数, 需重启数)。
+
+        做法：重新 load_config 一次，把「可变的字典段」原地 clear+update，
+        这样所有持有 self.cfg 引用的界面代码立即读到新值；
+        路径类标量（data_dir/state_file/...）当前窗口已按旧值初始化 → 计数为「需重启」。
+        """
+        live = restart = 0
+        try:
+            fresh = load_config(self.cfg.path)
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._log_bind("reload_config 失败: %s" % e)
+            except Exception:
+                pass
+            return 0, 0
+        for attr in ("ui", "probe", "aggregation", "portal", "vm", "lifecycle"):
+            lv = getattr(self.cfg, attr, None)
+            nv = getattr(fresh, attr, None)
+            if isinstance(lv, dict) and isinstance(nv, dict):
+                if lv != nv:
+                    live += sum(1 for k in set(lv) | set(nv) if lv.get(k) != nv.get(k))
+                lv.clear()
+                lv.update(nv)
+        if self.cfg.tasks != fresh.tasks:
+            live += 1
+        self.cfg.tasks = fresh.tasks
+        self.cfg.raw = fresh.raw
+        for attr in ("data_dir", "state_file", "portal_file", "events_file",
+                     "speedtest_result"):
+            if getattr(self.cfg, attr, "") != getattr(fresh, attr, ""):
+                setattr(self.cfg, attr, getattr(fresh, attr, ""))
+                restart += 1
+        try:
+            self.root.title(self.cfg.ui["title"])
+        except Exception:
+            pass
+        try:
+            self.refresh()
+        except Exception:
+            pass
+        return live, restart
+
     def act_speedtest(self):
         self._run_speedtest()
 
@@ -3225,8 +3671,23 @@ class SimpleApp:
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         W = min(self.px(520), int(sw * 0.92))
         H = min(self.px(340), int(sh * 0.92))   # 约为原高度的 60%
-        root.geometry("%dx%d+%d+%d" % (W, H, max(0, (sw - W) // 2), max(0, (sh - H) // 3)))
+        x = max(0, (sw - W) // 2)
+        y = max(0, (sh - H) // 3)
+        # 界面状态持久化（2026-09-09 由内部测试版回灌）
+        self._ui_saved = load_ui_state(cfg)
+        self._geo_after = None
+        _g = parse_geometry(self._ui_saved.get("geometry"))
+        if _g:
+            gw, gh, gx, gy = _g
+            if gw >= self.px(420) and gh >= self.px(300) and gx >= 0 and gy >= 0 \
+                    and gx + 200 <= sw and gy + 100 <= sh:
+                W, H, x, y = gw, gh, gx, gy
+        _iv = self._ui_saved.get("interval_ms")
+        if isinstance(_iv, int) and _iv in (0, 15000, 30000, 60000):
+            self.interval_ms = _iv
+        root.geometry("%dx%d+%d+%d" % (W, H, x, y))
         root.minsize(self.px(420), self.px(300))
+        root.bind("<Configure>", self._on_configure, add="+")
         if TRAY_OK:
             try:
                 img = make_icon(cfg).resize((32, 32), Image.LANCZOS)
@@ -3245,6 +3706,28 @@ class SimpleApp:
     # ---------- 工具 ----------
     def px(self, n):
         return max(1, round(n * self.scale))
+
+    # ---------- 界面状态持久化 ----------
+    def _on_configure(self, _e):
+        """几何变化去抖保存（拖动窗口时 <Configure> 高频触发）。"""
+        if getattr(self, "_geo_after", None):
+            try:
+                self.root.after_cancel(self._geo_after)
+            except Exception:
+                pass
+        try:
+            self._geo_after = self.root.after(1200, self._save_ui_state)
+        except Exception:
+            self._geo_after = None
+
+    def _save_ui_state(self):
+        d = {"interval_ms": self.interval_ms}
+        try:
+            d["geometry"] = self.root.geometry()
+        except Exception:
+            pass
+        if save_ui_state(self.cfg, **d):
+            self._ui_saved.update(d)
 
     def _log_bind(self, msg):
         try:
@@ -3401,6 +3884,7 @@ class SimpleApp:
         self.interval_ms = {"15 秒": 15000, "30 秒": 30000, "60 秒": 60000,
                             "停": 0}.get(self.var_interval.get(), 15000)
         self._schedule()
+        self._save_ui_state()          # 记住刷新间隔
 
     def refresh(self):
         st = load_json(self.cfg.state_file)
@@ -3586,6 +4070,10 @@ class SimpleApp:
 
     def _final_quit(self):
         try:
+            self._save_ui_state()
+        except Exception:
+            pass
+        try:
             if self._icon is not None:
                 self._icon.stop()
         except Exception:
@@ -3692,7 +4180,21 @@ def build_simple_tray(app, root, cfg):
         ))
 
 
+def _safe_console():
+    """控制台可能是 GBK 代码页：把不可编码字符降级为 '?'。
+
+    否则 `--check` 在中文 Windows 控制台会因打印 '✓' 直接 UnicodeEncodeError 崩掉
+    （2026-09-09 由内部测试版回灌）。
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(errors="replace")   # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
 def main(argv=None):
+    _safe_console()
     ap = argparse.ArgumentParser(description="多桶聚合控制台")
     ap.add_argument("--config", "-c", default=None, help="配置文件（默认自动查找）")
     ap.add_argument("--check", action="store_true", help="只做配置自检并退出")
@@ -3713,6 +4215,11 @@ def main(argv=None):
 
     if args.check:
         print(config_summary(cfg))
+        # 结构性问题视为失败（便于 CI / 改完即验）；未配置项仍只提示不拦
+        probs = cfg.problems()
+        if probs:
+            print("\n!! 存在 %d 个结构性问题，请修正后重跑 --check" % len(probs))
+            return 1
         return 0
 
     ensure_single_instance()
@@ -3733,25 +4240,38 @@ def main(argv=None):
         return 0
 
     use_tray = TRAY_OK and not args.no_tray
+
+    def _on_close():
+        """关闭窗口 = 最小化到托盘（同时记住窗口几何）。"""
+        try:
+            app._save_ui_state()
+        except Exception:
+            pass
+        root.withdraw()
+
     if use_simple:
         app = SimpleApp(root, cfg)
         if use_tray:
             icon = build_simple_tray(app, root, cfg)
             app._icon = icon
-            root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw())
+            root.protocol("WM_DELETE_WINDOW", _on_close)
             icon.run_detached()
     else:
         app = App(root, cfg)
         if use_tray:
             icon = build_tray(app, root, cfg, on_advanced=lambda: root.deiconify())
             app._icon = icon
-            root.protocol("WM_DELETE_WINDOW", lambda: root.withdraw())
+            root.protocol("WM_DELETE_WINDOW", _on_close)
             icon.run_detached()
 
     root.mainloop()
     try:
         if app._icon is not None:
             app._icon.stop()
+    except Exception:
+        pass
+    try:
+        app._save_ui_state()    # 兜底：退出前再落一次界面状态
     except Exception:
         pass
     _remove_ui_marker(cfg)      # 兜底：撤心跳，防孤儿标记

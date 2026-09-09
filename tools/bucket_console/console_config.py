@@ -465,6 +465,18 @@ class Cfg:
         s.update(extra)
         return s
 
+    # 只替换「已知占位符」，未知 {xxx} 原样保留。
+    # 为什么：命令里常有 curl -w '%{http_code}' / awk '{print $1}' 这类花括号，
+    # 用 str.format(**s) 会直接 KeyError，按钮一点就抛异常（2026-09-09 由内部测试版回灌）。
+    _SUBST_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+    @classmethod
+    def _subst(cls, text: str, s: dict) -> str:
+        def rep(m):
+            k = m.group(1)
+            return str(s[k]) if k in s else m.group(0)
+        return cls._SUBST_RE.sub(rep, text)
+
     def argv_for(self, name: str, bucket: dict | None = None, **extra):
         """取动作命令并做占位符替换；未配置返回 None。"""
         a = self.action(name)
@@ -473,8 +485,38 @@ class Cfg:
         s = self.subs(bucket, **extra)
         argv = a["argv"]
         if isinstance(argv, str):
-            return argv.format(**s)
-        return [str(x).format(**s) for x in argv]
+            return self._subst(argv, s)
+        return [self._subst(str(x), s) for x in argv]
+
+    def problems(self) -> list[str]:
+        """结构性配置问题（与 unset_fields 不同：这些是「填了但互相矛盾/会互相覆盖」）。
+
+        --check 会把这些当作 FAIL 并以非零退出码返回（2026-09-09 增强）。
+        """
+        out = []
+        ids = [b["id"] for b in self.buckets]
+        dup = sorted({x for x in ids if ids.count(x) > 1})
+        if dup:
+            out.append("buckets 存在重复 id：%s（后者会覆盖前者）" % dup)
+        sks = [b["state_key"] for b in self.buckets]
+        dups = sorted({x for x in sks if sks.count(x) > 1})
+        if dups:
+            out.append("buckets 存在重复 state_key：%s（状态会互相覆盖）" % dups)
+        for b in self.buckets:
+            p, r, c = b["probe"], b["renew"], b["clone"]
+            if p.get("mode") == "socks" and not p.get("socks"):
+                out.append("桶 %s：probe.mode=socks 但未填 probe.socks" % b["id"])
+            if p.get("mode") == "ssh" and not (p.get("ssh") or {}).get("host"):
+                out.append("桶 %s：probe.mode=ssh 但未填 probe.ssh.host" % b["id"])
+            if r.get("mode") == "ssh_ifup" and not (r.get("ssh") or {}).get("host"):
+                out.append("桶 %s：renew.mode=ssh_ifup 但未填 renew.ssh.host" % b["id"])
+            if r.get("mode") == "ssh_ifup" and not r.get("wan"):
+                out.append("桶 %s：renew.mode=ssh_ifup 但未填 renew.wan" % b["id"])
+            if b.get("kind") == "clone" and not c.get("portal_id"):
+                out.append("桶 %s：克隆桶缺 clone.portal_id" % b["id"])
+            if b.get("kind") == "clone" and c.get("gate", True) and not b.get("account"):
+                out.append("桶 %s：克隆桶开了真机闸但未填 account（判定会一直未知→拦截）" % b["id"])
+        return out
 
     def unset_fields(self) -> list[tuple[str, str]]:
         """返回 [(配置项, 填写提示)]，供 --check 与界面提示。"""
@@ -559,4 +601,11 @@ def config_summary(cfg: Cfg) -> str:
             lines.append("    · %s —— %s" % (key, hint))
     else:
         lines.append("  未配置项: 无 ✓")
+    probs = cfg.problems()
+    if probs:
+        lines.append("  !! 结构性问题 %d 个（需修正，--check 将以非零退出）：" % len(probs))
+        for p in probs:
+            lines.append("    · %s" % p)
+    else:
+        lines.append("  结构性问题: 无 ✓")
     return "\n".join(lines)
