@@ -453,8 +453,29 @@ python credstore.py remove <账号>
 
 **Q：某条腿丢包很高，为什么没被自动摘掉？**
 按顺序查三件事：①`aggregation.breaker.enabled` 是否为 `true`；②`actions.isolate_leg` 是否已配置
-（未配置只记录状态并提示，不会替你摘腿）；③熔断采样**只在高级界面运行时**进行，且 `keep_min`
-会阻止把腿摘到 0 条。也可以到「运维总控 → ⑥ 分流熔断」点「立即检查」并看每桶丢包率。
+（未配置或命令执行失败 → 只采样并提示，不会摘腿、也**不会**标记「已隔离」）；③熔断采样**只在高级界面运行时**进行，
+且 `keep_min` 会阻止把腿摘到 0 条。也可以到「运维总控 → ⑥ 分流熔断」点「立即检查」并看每桶丢包率，
+或直接跑 `python leg_ctl.py -c config.private.json list` 看腿列表与摘除状态。
 
 **Q：`--selftest` 是干什么的？**
 构造全部界面 + 首次刷新后立刻退出，用于改配置后快速验证不会崩，不弹窗、不起托盘。
+
+---
+
+## 9. 自检与回归
+
+改完配置或代码后，按下面这条链跑一遍即可（全部只读、可重复运行，失败非零退出）：
+
+```bash
+python bucket_console.py --config config.private.json --check   # 配置自检（列出未配置项/结构性问题）
+python bucket_console.py --selftest                            # 界面构建冒烟
+python checks/verify_ports.py                                  # P1–P11：回灌修复 + 熔断 + 桶停用
+python checks/verify_leg_ctl.py                                # 摘腿/放腿全行为（含本地假控制面）
+```
+
+| 脚本 | 覆盖 |
+|---|---|
+| `checks/verify_ports.py` | `task_state` 解析、真机闸新鲜度、表格选中保持、按钮忙碌态、模式文件原子写、占位符安全替换、配置结构性自检、配置编辑器（保存/备份/校验/热更新）、**分流熔断**（抖动不误摘 / `keep_min` / 恢复需连续达标 / 状态落盘 / 动作失败不假装已隔离）、**桶停用**（不探测不写状态） |
+| `checks/verify_leg_ctl.py` | 文本级解析与渲染（引号/注释/顺序）、`off`/`on`/幂等、`keep_min` 与未知腿拒绝、`--dry-run` 不落盘、母本播种告警、漂移 `sync`、`sync --from-breaker`、热更新失败与跳过语义、本地假控制面校验 PUT 的 URL 与请求体 |
+
+> 两个脚本都自带临时目录与假服务，**不碰你的真实配置与网络**。
