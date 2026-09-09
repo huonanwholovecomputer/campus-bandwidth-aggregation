@@ -58,19 +58,19 @@ FULL_YAML = """# 腿列表（母本）
 proxies:
   - name: "A-direct"
     type: socks5
-    server: 10.0.0.1
+    server: leg-a.test
     port: 1080
   - name: B-socks
     type: socks5
-    server: 10.0.0.2
+    server: leg-b.test
     port: 1081
   - name: C-eth3
     type: socks5
-    server: 10.0.0.3
+    server: leg-c.test
     port: 1082
   - name: D-eth4
     type: socks5
-    server: 10.0.0.4
+    server: leg-d.test
     port: 1083
 """
 
@@ -110,7 +110,7 @@ try:
           ["A-direct", "B-socks", "C-eth3", "D-eth4"], [b["name"] for b in blocks])
     check("引号名被去引号", blocks[0]["name"] == "A-direct", blocks[0]["name"])
     check("server/port 解析正确",
-          (blocks[2]["server"], blocks[2]["port"]) == ("10.0.0.3", 1082),
+          (blocks[2]["server"], blocks[2]["port"]) == ("leg-c.test", 1082),
           (blocks[2]["server"], blocks[2]["port"]))
     r = lc.render_legs(FULL_YAML, ["B-socks"])
     check("渲染剔除 B 且保留其余 3 条",
