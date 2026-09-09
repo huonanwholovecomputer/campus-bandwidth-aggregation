@@ -83,6 +83,16 @@
       "interval_s": 60,
       "keep_min": 1,
       "start_delay_s": 12
+    },
+
+    "legs": {
+      "_note": "可选：腿列表维护（供随附的 leg_ctl.py 使用）。provider_file = 聚合出口实际读取的节点列表文件；full_file 留空 = 同目录 <名>.full.yaml（母本，首次自动播种）；provider_name = 热更新用的 provider 名（mihomo：PUT /providers/proxies/<名>）；api 留空则复用 aggregation.api。不填这一段 → 熔断只做采样与提示",
+      "provider_file": "<聚合出口读取的节点列表文件>",
+      "full_file": "",
+      "provider_name": "<proxy-provider 名>",
+      "api": "",
+      "keep_min": 1,
+      "backup_keep": 10
     }
   },
 
@@ -242,13 +252,14 @@
       "argv": null
     },
     "vm_status": { "desc": "虚拟路由状态详情", "timeout": 60, "argv": null },
+    "_example_isolate_leg": "配好 aggregation.legs 之后，把下面两段 argv 填进 isolate_leg / restore_leg 即可用随附脚本摘腿/放腿：[\"python\",\"leg_ctl.py\",\"--config\",\"{config}\",\"off\",\"--leg\",\"{leg}\",\"--reason\",\"loss={loss}\"] 与 [\"python\",\"leg_ctl.py\",\"--config\",\"{config}\",\"on\",\"--leg\",\"{leg}\"]（详见 README §3.8）",
     "isolate_leg": {
-      "desc": "分流熔断·隔离腿：可用 {bucket} {account} {leg} {loss}（丢包率%）—— 由你的聚合出口如何摘腿决定，本工具不假设",
+      "desc": "分流熔断·隔离腿：摘腿命令（可用 {bucket} {account} {leg} {loss}）—— 未配置则熔断只采样并提示，不会摘腿、也不会标记「已隔离」",
       "timeout": 60,
       "argv": null
     },
     "restore_leg": {
-      "desc": "分流熔断·恢复腿：同上（把腿加回聚合）",
+      "desc": "分流熔断·恢复腿：放腿命令（同上）",
       "timeout": 60,
       "argv": null
     }

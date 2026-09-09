@@ -330,6 +330,32 @@ def _norm_action(raw, base: str) -> dict:
     }
 
 
+def _norm_legs(raw, base: str, data_dir: str, api_fallback: str = "") -> dict:
+    """腿列表维护配置（随附的 leg_ctl.py 用）：母本全量文件 + 生效文件 + 热更新入口。
+
+    · provider_file：聚合出口**实际读取**的节点列表（会被脚本按剔除集合重渲染）
+    · full_file    ：全量定义母本，留空 = 同目录 <名>.full.yaml（首次自动播种）
+    · provider_name：热更新时的 provider 名（mihomo：PUT /providers/proxies/<名>）
+    """
+    d = raw if isinstance(raw, dict) else {}
+    pf = "" if is_unset(d.get("provider_file")) else expand_path(d.get("provider_file"), base)
+    full = "" if is_unset(d.get("full_file")) else expand_path(d.get("full_file"), base)
+    if pf and not full:
+        root, ext = os.path.splitext(pf)
+        full = root + ".full" + (ext or ".yaml")
+    return {
+        "provider_file": pf,
+        "full_file": full,
+        "provider_name": "" if is_unset(d.get("provider_name"))
+                         else (d.get("provider_name") or "").strip(),
+        "api": (("" if is_unset(d.get("api")) else (d.get("api") or ""))
+                or api_fallback or "").rstrip("/"),
+        "state_file": expand_path(d.get("state_file") or "legs_excluded.json", data_dir),
+        "keep_min": max(0, int(d.get("keep_min") or 1)),
+        "backup_keep": max(0, int(d.get("backup_keep") or 10)),
+    }
+
+
 class Cfg:
     """归一化后的配置视图。"""
 
@@ -412,6 +438,9 @@ class Cfg:
                 "keep_min": max(0, int(br.get("keep_min", 1))),
                 "start_delay_s": max(0, int(br.get("start_delay_s", 12))),
             },
+            # 腿列表维护（供随附的 leg_ctl.py 使用；不填则熔断只做采样与提示）
+            "legs": _norm_legs(ag.get("legs"), self.base_dir, self.data_dir,
+                               "" if is_unset(ag.get("api")) else (ag.get("api") or "")),
         }
 
         po = raw.get("portal") or {}
@@ -532,6 +561,13 @@ class Cfg:
                 out.append("桶 %s：克隆桶缺 clone.portal_id" % b["id"])
             if b.get("kind") == "clone" and c.get("gate", True) and not b.get("account"):
                 out.append("桶 %s：克隆桶开了真机闸但未填 account（判定会一直未知→拦截）" % b["id"])
+        lg = self.aggregation.get("legs") or {}
+        pf, full = lg.get("provider_file") or "", lg.get("full_file") or ""
+        if pf and full and os.path.abspath(pf) == os.path.abspath(full):
+            out.append("aggregation.legs：provider_file 与 full_file 是同一个文件"
+                       "（渲染会覆盖母本，腿会永久丢失）")
+        if pf and not os.path.exists(pf):
+            out.append("aggregation.legs.provider_file 不存在：%s" % pf)
         return out
 
     def unset_fields(self) -> list[tuple[str, str]]:

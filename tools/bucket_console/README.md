@@ -15,7 +15,9 @@ tools/bucket_console/
 ├── console_config.py     配置模型（归一化 / 占位符 / 自检）
 ├── credstore.py          凭据库（DPAPI / 钥匙串 / 文件降级）+ CLI
 ├── probe_buckets.py      参考「状态生产端」（204 探测 → 状态 JSON）
+├── leg_ctl.py            参考「腿列表维护」（分流熔断的摘腿/放腿）
 ├── config.example.json   配置模板（复制为 config.private.json 后填值）
+├── checks/               回归校验（verify_ports / verify_leg_ctl）
 └── README.md             本文件
 ```
 
@@ -51,6 +53,7 @@ python bucket_console.py --config config.private.json
 | `python bucket_console.py --no-tray` | 不启用托盘（纯窗口） |
 | `python probe_buckets.py -c config.private.json` | 跑一轮探测，写状态文件 |
 | `python probe_buckets.py -c config.private.json --only A` | 只探某个桶 |
+| `python leg_ctl.py -c config.private.json list` | 列出腿列表与摘除状态（见 §3.8） |
 | `python credstore.py backend / list / set / get / remove` | 凭据库维护 |
 
 ### 1.1 简单界面（默认）
@@ -249,13 +252,69 @@ python bucket_console.py --config config.private.json
 - 界面位置：**高级界面 → 运维总控 → ⑥ 分流熔断**：启用勾选框、参数摘要、「立即检查」、「重置状态」，
   以及每桶的丢包率 / 正常·已隔离 / 手动「隔离」「恢复」按钮。
 
+> ⚠️ 采样只在**高级界面**运行时进行（简单界面/托盘运行期间不采样），避免同一时刻两处同时探测。
+> 停用桶（`enabled: false`）与 `probe.mode: none` 的桶不参与采样。
+
 > 不知道这两条命令该怎么写？看你聚合出口的形态：
-> ①能热更新节点列表（如 mihomo 的 `PUT /providers/proxies/<名>`）→ 写个小脚本「从 provider 文件里移除/放回该腿 + 热更新」；
+> ①节点列表在独立文件里、聚合出口读取它 → 直接用随附的 `leg_ctl.py`（见 §3.8，开箱可用）；
 > ②有 REST/CLI 管理面 → 直接调它的「禁用/启用节点」接口；
 > ③都没有 → 先留空：熔断仍会按桶采样丢包率并在界面显示，只是不会真的摘腿。
 
-> ⚠️ 采样只在**高级界面**运行时进行（简单界面/托盘运行期间不采样），避免同一时刻两处同时探测。
-> 停用桶（`enabled: false`）与 `probe.mode: none` 的桶不参与采样。
+### 3.8 腿列表维护脚本 `leg_ctl.py`
+
+`isolate_leg` / `restore_leg` 的**现成实现**，适用于「节点列表放在独立文件、由聚合出口读取」
+的形态（mihomo / clash 系 proxy-provider、各类自建聚合器的节点清单）。
+
+**三个文件的分工**（配置段 `aggregation.legs`）：
+
+| 键 | 作用 |
+|---|---|
+| `provider_file` | 聚合出口**实际读取**的节点列表；脚本按剔除集合重新渲染它 |
+| `full_file` | **母本全量定义**；留空 = 同目录 `<名>.full.yaml`，首次自动播种。脚本只从母本渲染，永不丢腿 |
+| `provider_name` + `api` | 热更新入口：`PUT <api>/providers/proxies/<provider_name>`（mihomo external-controller）；`api` 留空则复用 `aggregation.api` |
+| `keep_min` | 至少保留几条腿（默认 1） |
+| `backup_keep` | 保留最近几份 `.bak-<时间戳>`（默认 10，0 = 不清理） |
+
+**接进熔断**（配好 `aggregation.legs` 之后）：
+
+```json
+"isolate_leg": {
+  "timeout": 60,
+  "argv": ["python", "leg_ctl.py", "--config", "{config}",
+           "off", "--leg", "{leg}", "--reason", "loss={loss}"]
+},
+"restore_leg": {
+  "timeout": 60,
+  "argv": ["python", "leg_ctl.py", "--config", "{config}", "on", "--leg", "{leg}"]
+}
+```
+
+**手动排障**：
+
+```bash
+python leg_ctl.py -c config.private.json list          # 腿列表 + 摘除状态 + 漂移检测
+python leg_ctl.py -c config.private.json status        # 配置摘要
+python leg_ctl.py -c config.private.json off --leg C-eth3 --dry-run   # 只看看会怎么改
+python leg_ctl.py -c config.private.json on  --leg C-eth3
+python leg_ctl.py -c config.private.json sync                  # 按剔除集合重建生效文件
+python leg_ctl.py -c config.private.json sync --from-breaker    # 用控制台熔断态当剔除集合
+```
+
+**安全设计**（摘腿改的是你的网络出口，所以刻意保守）：
+
+- 只从**母本**渲染，母本永不被改写；渲染前逐条校验，**遇到不认识的名字直接拒绝**（退出码 3）；
+- 原子写 + 每次改动前自动备份 `provider_file.bak-<时间戳>`，并保留最近 `backup_keep` 份；
+- `keep_min` 保护：不会把腿摘到少于 N 条（退出码 4）；
+- 幂等：重复摘/放同一条腿不报错、不重复写；
+- 母本缺失时从生效文件播种，但会**显著告警**并把来源写进状态（`status` 可复查）——
+  因为生效文件可能已是剔除后的结果，直接当母本会永久丢腿；
+- 热更新失败：文件照样写好、状态照样记录，退出码 5，提示「重启聚合出口后生效」；
+- 只识别块状节点定义（`- name: xxx`）；遇到 `- {name: ...}` 流式写法**明确拒绝**，宁可不做也不猜错。
+
+退出码：`0` 成功 / `2` 配置错误 / `3` 腿列表文件问题 / `4` 触发 keep_min 保护 / `5` 热更新失败。
+状态文件：`app.data_dir/legs_excluded.json`（剔除集合 + 上次动作；删除它等于「全部放回」，再跑一次 `sync` 即可）。
+
+> `python checks/verify_leg_ctl.py` 覆盖上述全部行为（含本地假控制面验证 PUT 的 URL 与请求体）。
 
 ---
 

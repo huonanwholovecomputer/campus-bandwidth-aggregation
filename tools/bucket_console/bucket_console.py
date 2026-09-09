@@ -3256,6 +3256,12 @@ class App:
         self.ops_br_note = ttk.Label(fBk, text="—", anchor="w", foreground="#666",
                                      wraplength=self.px(900), justify="left")
         self.ops_br_note.pack(fill="x", padx=self.px(4), pady=(0, self.px(2)))
+        _lg = self.cfg.aggregation.get("legs") or {}
+        if _lg.get("provider_file"):
+            ttk.Label(fBk, text="腿列表：%s（母本 %s）—— 由 leg_ctl.py 维护"
+                      % (_lg["provider_file"], _lg.get("full_file") or "—"),
+                      foreground="#8d8d8d", wraplength=self.px(900), justify="left"
+                      ).pack(anchor="w", padx=self.px(4))
         self.ops_br_rows = {}
         for b in self.cfg.buckets:
             row = ttk.Frame(fBk)
@@ -3279,6 +3285,7 @@ class App:
             "（可用 {bucket} {account} {leg} {loss} 占位符）。\n"
             "未配置（或命令执行失败）→ 只采样并提示，**不会**把桶标成「已隔离」，"
             "界面状态永远与你的聚合出口一致。\n"
+            "随附的 leg_ctl.py 就是这两条命令的现成实现（维护节点列表 + 热更新，见 README §3.8）。\n"
             "⚠️ 熔断采样只在「高级界面」运行时进行（简单界面/托盘运行期间不采样）。"
         )).pack(anchor="w", padx=self.px(4), pady=(0, self.px(2)))
         while self._breaker_render in _BR_RENDER_CBS:
