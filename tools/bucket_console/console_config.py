@@ -150,6 +150,7 @@ def new_bucket_template(bid="NEW") -> dict:
         "label": "新桶",
         "state_key": "b_" + str(bid).lower(),
         "kind": "self",
+        "enabled": True,
         "account": "",
         "mac": "",
         "desc": "",
@@ -266,6 +267,7 @@ def _norm_bucket(raw: dict, base: str, idx: int) -> dict:
         "state_key": raw.get("state_key") or ("b_" + bid.lower()),
         "desc": raw.get("desc") or "",
         "kind": kind,
+        "enabled": bool(raw.get("enabled", True)),   # 停用桶：不探测/不动作/界面置灰
         "account": raw.get("account") or "",
         "owner": raw.get("owner") or "",
         "mac": (raw.get("mac") or ""),
@@ -385,6 +387,7 @@ class Cfg:
         }
 
         ag = raw.get("aggregation") or {}
+        br = ag.get("breaker") or {}
         self.aggregation = {
             "api": "" if is_unset(ag.get("api")) else (ag["api"] or "").rstrip("/"),
             "group": "" if is_unset(ag.get("group")) else (ag.get("group") or ""),
@@ -396,6 +399,19 @@ class Cfg:
             "restart_action": ag.get("restart_action") or "restart_aggregator",
             "proxy_enabled": bool(ag.get("proxy_enabled", True)),
             "dir": expand_path(ag.get("dir"), self.base_dir),
+            # 分流熔断（2026-09-09 由内部测试版通用化回灌）：丢包过高的桶腿自动隔离/恢复。
+            # 决策在本控制台，执行走 actions.isolate_leg / restore_leg（用户自己配置的命令）。
+            "breaker": {
+                "enabled": bool(br.get("enabled", True)),
+                "threshold_pct": int(br.get("threshold_pct", 50)),
+                "trip_after": int(br.get("trip_after", 2)),
+                "recover_below_pct": int(br.get("recover_below_pct", 10)),
+                "recover_after": int(br.get("recover_after", 3)),
+                "tries": int(br.get("tries", 5)),
+                "interval_s": max(15, int(br.get("interval_s", 60))),
+                "keep_min": max(0, int(br.get("keep_min", 1))),
+                "start_delay_s": max(0, int(br.get("start_delay_s", 12))),
+            },
         }
 
         po = raw.get("portal") or {}

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""回归校验：本轮从内部测试版回灌到开源版的 6 项修复。
+"""回归校验：从内部测试版回灌到开源版的修复 / 通用化能力。
 
 覆盖：
   P1 task_state 3 列解析 + 本地化状态归一
@@ -8,6 +8,10 @@
   P5 按钮忙碌态
   P6 模式文件原子写
   P7 命令占位符只替换已知键（curl -w '%{http_code}' 不再 KeyError）
+  P8 配置结构性自检（重复 id / state_key）
+  P9 配置编辑器（热更新 / 非法值不写盘 / .bak 备份）
+  P10 分流熔断（连续超阈值隔离 / 连续达标恢复 / keep_min 保护 / 状态落盘）
+  P11 桶停用-启用（enabled=false 不探测不动作）
 
 用法: python checks/verify_ports.py
 """
@@ -190,6 +194,88 @@ try:
         except Exception:
             pass
     _sh.rmtree(_d9, ignore_errors=True)
+    print("\n== P10 分流熔断 ==")
+    brs = {"threshold_pct": 50, "trip_after": 2, "recover_below_pct": 10,
+           "recover_after": 3, "keep_min": 1}
+
+    def _br_reset():
+        bc._BR["tripped"], bc._BR["fail"], bc._BR["ok"] = set(), {}, {}
+
+    _bs = [{"id": "A"}, {"id": "B"}, {"id": "C"}]
+    _br_reset()
+    _a1 = bc.breaker_round(brs, _bs, {"A": 80, "B": 0, "C": 0})
+    _a2 = bc.breaker_round(brs, _bs, {"A": 80, "B": 0, "C": 0})
+    check("第 1 轮超阈值不隔离（避免单轮抖动误摘）", _a1 == [], _a1)
+    check("连续 2 轮超阈值 → 隔离 A",
+          [(b["id"], iso) for b, iso, _l in _a2] == [("A", True)], _a2)
+    _a3 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 0})
+    _a4 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 0})
+    _a5 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 0})
+    check("恢复需连续 3 轮达标（前两轮不动）", _a3 == [] and _a4 == [], (_a3, _a4))
+    check("连续 3 轮达标 → 恢复 A",
+          [(b["id"], iso) for b, iso, _l in _a5] == [("A", False)], _a5)
+    _br_reset()
+    bc._BR["tripped"] = {"A", "B"}          # 只剩 C 活跃，keep_min=1 → 不许摘
+    _a6 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 100})
+    _a7 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 100})
+    check("keep_min 保护：不允许摘到 0 条腿", _a6 == [] and _a7 == [], (_a6, _a7))
+    _br_reset()
+    bc.breaker_round(brs, _bs, {"A": 90, "B": 0, "C": 0})
+    _a8 = bc.breaker_round(brs, _bs, {"A": 0, "B": 0, "C": 0})
+    _a9 = bc.breaker_round(brs, _bs, {"A": 90, "B": 0, "C": 0})
+    check("抖动回落会清零计数（不累计误隔离）", _a8 == [] and _a9 == [], (_a8, _a9))
+    # 采样范围：停用桶 / mode=none 不参与
+    _db = tempfile.mkdtemp(prefix="bc_p10_")
+    with open(os.path.join(os.path.dirname(HERE), "config.example.json"),
+              encoding="utf-8-sig") as f:
+        _raw = _json2.load(f)
+    _raw["app"]["data_dir"] = _db
+    _raw["buckets"][1]["enabled"] = False
+    _raw["buckets"][2].setdefault("probe", {})["mode"] = "none"
+    _p10 = os.path.join(_db, "cfg.json")
+    with open(_p10, "w", encoding="utf-8") as f:
+        _json2.dump(_raw, f, ensure_ascii=False)
+    _c10 = cc.load_config(_p10)
+    _sel = [b["id"] for b in bc.breaker_buckets(_c10)]
+    check("采样只含启用且非 none 的桶", _sel == [_raw["buckets"][0]["id"]], _sel)
+    check("breaker 配置已归一（含默认值）",
+          _c10.aggregation["breaker"]["threshold_pct"] == 50
+          and _c10.aggregation["breaker"]["enabled"] is True,
+          _c10.aggregation["breaker"])
+    _br_reset()
+    bc._BR["last"], bc._BR["fail"], bc._BR["ok"] = {"A": 42}, {"A": 1}, {"B": 2}
+    bc._BR["tripped"] = {"B"}
+    bc._BR["note"] = "回归测试"
+    check("熔断状态落盘", bc.breaker_save(_c10))
+    check("状态文件存在", os.path.exists(bc.breaker_state_path(_c10)),
+          bc.breaker_state_path(_c10))
+    bc._BR["last"], bc._BR["fail"], bc._BR["ok"], bc._BR["tripped"] = {}, {}, {}, set()
+    bc.breaker_load(_c10)
+    check("状态可读回",
+          bc._BR["tripped"] == {"B"} and bc._BR["last"].get("A") == 42
+          and bc._BR["ok"].get("B") == 2, (bc._BR["tripped"], bc._BR["last"]))
+    _sh.rmtree(_db, ignore_errors=True)
+
+    print("\n== P11 桶停用 / 启用 ==")
+    _d11 = tempfile.mkdtemp(prefix="bc_p11_")
+    with open(os.path.join(os.path.dirname(HERE), "config.example.json"),
+              encoding="utf-8-sig") as f:
+        _raw11 = _json2.load(f)
+    _raw11["app"]["data_dir"] = _d11
+    _raw11["buckets"][0]["enabled"] = False
+    _p11 = os.path.join(_d11, "cfg.json")
+    with open(_p11, "w", encoding="utf-8") as f:
+        _json2.dump(_raw11, f, ensure_ascii=False)
+    _c11 = cc.load_config(_p11)
+    check("enabled=false 被读入", _c11.buckets[0]["enabled"] is False)
+    check("未写 enabled 的桶默认启用", _c11.buckets[1]["enabled"] is True)
+    check("新建桶模板默认启用", cc.new_bucket_template("X")["enabled"] is True)
+    import probe_buckets as pb
+    _res, _upd = pb.probe_all(_c11, only=[_c11.buckets[0]["id"]])
+    _r0 = _res[_c11.buckets[0]["id"]]
+    check("停用桶不探测（state=n/a 且不写状态）",
+          _r0["state"] == "n/a" and not _upd, (_r0["state"], _upd))
+    _sh.rmtree(_d11, ignore_errors=True)
 finally:
     try:
         root.destroy()
@@ -201,4 +287,4 @@ if fails:
     for f in fails:
         print("  [FAIL] %s" % f)
     raise SystemExit(1)
-print("  [OK] P1-P9 回灌修复全部通过")
+print("  [OK] P1-P11 回灌修复 / 通用化能力全部通过")

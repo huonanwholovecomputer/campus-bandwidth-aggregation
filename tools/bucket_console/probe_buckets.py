@@ -231,6 +231,12 @@ def probe_all(cfg, only=None):
     for b in cfg.buckets:
         if only and b["id"] not in only:
             continue
+        if not b.get("enabled", True):
+            # 停用桶：不探测、不写状态（界面按「已停用」置灰显示）
+            results[b["id"]] = {"codes": [], "state": "n/a", "portal": False, "body": "",
+                                "detail": "该桶已停用（enabled=false）",
+                                "http_loss": None, "icmp_loss": None}
+            continue
         r = probe_bucket(cfg, b)
         results[b["id"]] = r
         if r["state"] != "n/a":

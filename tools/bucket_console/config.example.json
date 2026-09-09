@@ -15,6 +15,8 @@
     "续连方式": "renew.mode = ssh_ifup(执行 ifup <wan>) / command(执行 renew_bucket 动作) / none",
     "真机闸": "克隆桶 renew.gate=true 时，续连前必须先刷新门户判定：目标真机在线或判定不了 → 拦截",
     "所属": "buckets[].owner = 该桶账号的身份标签（自己/室友A…）；账号密码页的「所属」列就取它",
+    "停用桶": "buckets[].enabled=false → 不探测、不动作、界面置灰（临时停用某条腿时用它，不用删配置）",
+    "分流熔断": "aggregation.breaker：按桶丢包采样，连续超阈值自动隔离、连续达标自动恢复；执行走 actions.isolate_leg / restore_leg",
     "未配置项": "probe.target / aggregation.api / 各 actions 都可留空；控制台会自动降级并提示"
   },
 
@@ -68,7 +70,20 @@
     "mode_file": "aggregator_mode.txt",
     "restart_action": "restart_aggregator",
     "proxy_enabled": true,
-    "dir": "<聚合出口配置目录>"
+    "dir": "<聚合出口配置目录>",
+
+    "breaker": {
+      "_note": "分流熔断：控制台按桶采样丢包率，连续超阈值的腿自动隔离、连续达标自动恢复。enabled=false 则完全不采样。执行动作见 actions.isolate_leg / restore_leg（未配置时只记录状态并提示）",
+      "enabled": true,
+      "threshold_pct": 50,
+      "trip_after": 2,
+      "recover_below_pct": 10,
+      "recover_after": 3,
+      "tries": 5,
+      "interval_s": 60,
+      "keep_min": 1,
+      "start_delay_s": 12
+    }
   },
 
   "portal": {
@@ -94,6 +109,7 @@
       "label": "本机有线 · 无感",
       "state_key": "b_a",
       "kind": "self",
+      "enabled": true,
       "account": "<账号甲>",
       "owner": "自己",
       "mac": "<MAC_A>",
@@ -108,6 +124,7 @@
       "label": "路由器第二会话",
       "state_key": "b_b",
       "kind": "self",
+      "enabled": true,
       "account": "<账号甲>",
       "mac": "<MAC_B>",
       "desc": "<LAN接口> · 经路由器出口",
@@ -133,6 +150,7 @@
       "label": "手机桶 · 克隆无感",
       "state_key": "b_c",
       "kind": "clone",
+      "enabled": true,
       "account": "<账号甲>",
       "mac": "<设备MAC>",
       "desc": "<接口名> · 克隆手机真机标识",
@@ -223,7 +241,17 @@
       "confirm": "关机将同时断开该虚拟路由承载的所有克隆腿，直到重新开机 + 续约才恢复。继续？",
       "argv": null
     },
-    "vm_status": { "desc": "虚拟路由状态详情", "timeout": 60, "argv": null }
+    "vm_status": { "desc": "虚拟路由状态详情", "timeout": 60, "argv": null },
+    "isolate_leg": {
+      "desc": "分流熔断·隔离腿：可用 {bucket} {account} {leg} {loss}（丢包率%）—— 由你的聚合出口如何摘腿决定，本工具不假设",
+      "timeout": 60,
+      "argv": null
+    },
+    "restore_leg": {
+      "desc": "分流熔断·恢复腿：同上（把腿加回聚合）",
+      "timeout": 60,
+      "argv": null
+    }
   },
 
   "tasks": [

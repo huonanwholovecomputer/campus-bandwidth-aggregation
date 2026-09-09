@@ -680,6 +680,286 @@ def open_config_dialog(app):
     return _ConfigDialog(app)
 
 
+def reload_config_inplace(app):
+    """保存配置后就地热更新（App / SimpleApp 通用，不重建窗口）。
+
+    做法：重新 load_config 一次，把「可变的字典段」原地 clear+update，
+    这样所有持有 app.cfg 引用的界面代码立即读到新值；
+    路径类标量（data_dir/state_file/...）当前窗口已按旧值初始化 → 计数为「需重启」。
+    返回 (即时生效数, 需重启数)。
+    """
+    live = restart = 0
+    cfg = app.cfg
+    try:
+        fresh = load_config(cfg.path)
+    except Exception as e:  # noqa: BLE001
+        try:
+            app._log_bind("reload_config 失败: %s" % e)
+        except Exception:
+            pass
+        return 0, 0
+    for attr in ("ui", "probe", "aggregation", "portal", "vm", "lifecycle"):
+        lv = getattr(cfg, attr, None)
+        nv = getattr(fresh, attr, None)
+        if isinstance(lv, dict) and isinstance(nv, dict):
+            if lv != nv:
+                live += sum(1 for k in set(lv) | set(nv) if lv.get(k) != nv.get(k))
+            lv.clear()
+            lv.update(nv)
+    if cfg.tasks != fresh.tasks:
+        live += 1
+    cfg.tasks = fresh.tasks
+    cfg.raw = fresh.raw
+    for attr in ("data_dir", "state_file", "portal_file", "events_file", "speedtest_result"):
+        if getattr(cfg, attr, "") != getattr(fresh, attr, ""):
+            setattr(cfg, attr, getattr(fresh, attr, ""))
+            restart += 1
+    try:
+        app.root.title(cfg.ui["title"])
+    except Exception:
+        pass
+    try:
+        app.refresh()
+    except Exception:
+        pass
+    return live, restart
+
+
+# ---------------- 分流熔断（P10 · 2026-09-09 由内部测试版通用化回灌） ----------------
+# 为什么需要：聚合出口多为轮询/哈希分流，某条腿丢包严重时单次健康检查仍可能通过，
+# 它会继续吃 1/N 流量，把整体延迟拖高。本模块按「每桶连续多轮丢包率」判定：
+#   连续 trip_after 轮 ≥ threshold_pct  → 隔离（执行 actions.isolate_leg）
+#   连续 recover_after 轮 ≤ recover_below_pct → 恢复（执行 actions.restore_leg）
+# 决策在本控制台，**执行完全走用户配置的命令**（本工具不假设你怎么摘腿）。
+_BR = {
+    "inited": False,
+    "tripped": set(),      # bucket id -> 已隔离
+    "last": {},            # bucket id -> 最近一轮丢包率%
+    "fail": {},            # bucket id -> 连续不合格轮数
+    "ok": {},              # bucket id -> 连续合格轮数
+    "busy": False,
+    "busy_t": 0.0,
+    "note": "尚未检查",
+    "time": "",
+}
+_BR_BUSY_TIMEOUT = 300.0
+_BR_RENDER_CBS = []        # 各窗口注册的渲染回调（采样后统一刷新）
+
+
+def breaker_state_path(cfg):
+    return os.path.join(cfg.data_dir, "breaker_state.json")
+
+
+def breaker_load(cfg):
+    """读回上次采样与隔离集合（重启不丢状态）。"""
+    d = load_json(breaker_state_path(cfg)) or {}
+    if not isinstance(d, dict):
+        return
+    _BR["tripped"] = set(str(x) for x in (d.get("tripped") or []))
+    _BR["last"] = {str(k): v for k, v in (d.get("last") or {}).items()}
+    for k in ("fail", "ok"):
+        _BR[k] = {}
+        for kk, vv in (d.get(k) or {}).items():
+            try:
+                _BR[k][str(kk)] = int(vv or 0)
+            except Exception:
+                pass
+    _BR["note"] = d.get("note") or "尚未检查"
+    _BR["time"] = d.get("time") or ""
+
+
+def breaker_save(cfg):
+    """原子写熔断运行态（丢包采样 / 已隔离集合）。"""
+    d = {"_note": "分流熔断运行态（丢包采样 / 已隔离桶），自动维护；删除即重置",
+         "time": time.strftime("%Y-%m-%d %H:%M:%S"), "tripped": sorted(_BR["tripped"]),
+         "last": _BR["last"], "fail": _BR["fail"], "ok": _BR["ok"], "note": _BR["note"]}
+    path = breaker_state_path(cfg)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+        return False
+
+
+def breaker_buckets(cfg):
+    """参与熔断采样的桶：启用中、且探测方式不是 none（停用桶不采样、不动作）。"""
+    return [b for b in cfg.buckets
+            if b.get("enabled", True) and (b["probe"].get("mode") or "local") != "none"]
+
+
+def breaker_round(s, buckets, losses):
+    """一轮熔断判定（纯逻辑，便于回归测试）。
+
+    s       : 配置里的 aggregation.breaker
+    buckets : 参与采样的桶（已过滤 enabled / mode=none）
+    losses  : {bucket_id: 丢包率% 或 None}
+    返回需要执行的动作 [(bucket, isolate:bool, loss), ...]；运行态写在 _BR 里。
+    """
+    acts = []
+    thr = int(s.get("threshold_pct", 50))
+    rec = int(s.get("recover_below_pct", 10))
+    trip_n = int(s.get("trip_after", 2))
+    rec_n = int(s.get("recover_after", 3))
+    keep_min = int(s.get("keep_min", 1))
+    for b in buckets:
+        bid = b["id"]
+        loss = losses.get(bid)
+        if loss is None:
+            continue
+        if loss >= thr:
+            _BR["fail"][bid] = _BR["fail"].get(bid, 0) + 1
+            _BR["ok"][bid] = 0
+        elif loss <= rec:
+            _BR["ok"][bid] = _BR["ok"].get(bid, 0) + 1
+            _BR["fail"][bid] = 0
+        active = len([x for x in buckets if x["id"] not in _BR["tripped"]])
+        if (bid not in _BR["tripped"] and _BR["fail"].get(bid, 0) >= trip_n
+                and active > keep_min):
+            _BR["tripped"].add(bid)
+            acts.append((b, True, loss))
+        elif bid in _BR["tripped"] and _BR["ok"].get(bid, 0) >= rec_n:
+            _BR["tripped"].discard(bid)
+            acts.append((b, False, loss))
+    return acts
+
+
+class BreakerRunner:
+    """按桶采样丢包率 → 连续超阈值则隔离、连续达标则恢复。"""
+
+    def __init__(self, app):
+        self.app = app
+        self.root = app.root
+        self._after = None
+
+    def settings(self):
+        return (self.app.cfg.aggregation.get("breaker") or {})
+
+    def start(self):
+        s = self.settings()
+        if not s.get("enabled", True):
+            return
+        if not _BR["inited"]:
+            breaker_load(self.app.cfg)
+            _BR["inited"] = True
+        delay = int(s.get("start_delay_s") or 12) * 1000
+        try:
+            self._after = self.root.after(delay, self._loop)
+        except Exception:
+            self._after = None
+
+    def _loop(self):
+        try:
+            self.run_once()
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.app._log_bind("breaker loop err: %s" % e)
+            except Exception:
+                pass
+        s = self.settings()
+        try:
+            self._after = self.root.after(max(15, int(s.get("interval_s") or 60)) * 1000,
+                                          self._loop)
+        except Exception:
+            pass
+
+    def run_once(self):
+        """跑一轮采样（后台线程执行探测，主线程渲染）。"""
+        s = self.settings()
+        if _BR["busy"]:
+            age = time.time() - float(_BR.get("busy_t") or 0)
+            if age < _BR_BUSY_TIMEOUT:
+                return
+            _BR["busy"] = False          # 上一轮异常未收尾 → 超时自解
+            _BR["note"] = "上一轮超时自解（%.0fs）" % age
+        if PB is None:
+            _BR["note"] = "缺少 probe_buckets.py，无法采样"
+            self._render_async()
+            return
+        buckets = breaker_buckets(self.app.cfg)
+        if not buckets:
+            _BR["note"] = "没有可采样的桶（探测方式均为 none 或桶已停用）"
+            self._render_async()
+            return
+        _BR["busy"] = True
+        _BR["busy_t"] = time.time()
+        _BR["note"] = "检查中…"
+        self._render_async()
+
+        def work():
+            try:
+                tries = int(s.get("tries", 5))
+                losses = {}
+                for b in buckets:
+                    try:
+                        r = PB.probe_bucket(self.app.cfg, b, tries=tries)
+                        losses[b["id"]] = r.get("http_loss")
+                    except Exception:  # noqa: BLE001
+                        losses[b["id"]] = None
+                    _BR["last"][b["id"]] = losses[b["id"]]
+                acts = breaker_round(s, buckets, losses)
+                for b, isolate, loss in acts:
+                    self._apply(b, isolate=isolate, loss=loss)
+                _BR["note"] = ("本轮隔离/恢复 %d 条" % len(acts)) if acts else "本轮无变更"
+            finally:
+                _BR["busy"] = False
+                _BR["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                breaker_save(self.app.cfg)
+                try:
+                    self.root.after(0, self._render)
+                except Exception:
+                    pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply(self, bucket, isolate, loss=None):
+        """执行用户配置的隔离/恢复动作；未配置则只记录状态并在界面提示。"""
+        name = "isolate_leg" if isolate else "restore_leg"
+        verb = "隔离" if isolate else "恢复"
+        bid = bucket["id"]
+        try:
+            self.app._log_bind("breaker: %s %s（丢包 %s%%）" % (verb, bid, loss))
+        except Exception:
+            pass
+        if not self.app.cfg.action(name):
+            _BR["note"] = ("%s %s：未配置 actions.%s，仅记录状态"
+                           % (verb, bid, name))
+            return
+        try:
+            rc, out = exec_action(self.app.cfg, name, bucket, loss=str(loss))
+            if rc not in (0, None):
+                _BR["note"] = "%s %s 失败：%s" % (verb, bid, (out or "").splitlines()[-1:])
+        except Exception as e:  # noqa: BLE001
+            _BR["note"] = "%s %s 异常：%s" % (verb, bid, e)
+
+    def _render_async(self):
+        """把渲染投递回主线程（探测/动作都在后台线程里跑）。"""
+        try:
+            self.root.after(0, self._render)
+        except Exception:
+            pass
+
+    def _render(self):
+        for cb in list(_BR_RENDER_CBS):
+            try:
+                cb()
+            except Exception:
+                try:
+                    _BR_RENDER_CBS.remove(cb)
+                except Exception:
+                    pass
+
+
 # ---------------- 主界面（高级） ----------------
 class App:
     def __init__(self, root, cfg, auto_boot=True):
@@ -696,6 +976,7 @@ class App:
                           "legs_n": None, "mode": None, "err": ""}
         self._agg_busy = False
         self._chain_booted = False
+        self.breaker_runner = None       # 分流熔断（P10，UI 构建后启动）
         self._quitting = False
         self._icon = None
         # 桶管理：内存工作副本（保存后写回配置并重建界面）
@@ -761,6 +1042,13 @@ class App:
         self._build_ui()
         self.refresh()
         self._schedule()
+        # 分流熔断采样（P10）：配置启用后按 start_delay_s 起步，失败不影响主界面
+        try:
+            if self.breaker_runner is None:
+                self.breaker_runner = BreakerRunner(self)
+            self.breaker_runner.start()
+        except Exception:
+            pass
         # 标签页切换即记状态；启动时还原上次停留的页
         try:
             self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._save_ui_state())
@@ -1580,6 +1868,13 @@ class App:
         for row in self.tree.get_children():
             self.tree.delete(row)
         for b in self.cfg.buckets:
+            if not b.get("enabled", True):
+                # 停用桶：整行置灰、状态固定「已停用」（不跟随生产端状态）
+                self.tree.tag_configure("off_row", foreground="#8d8d8d")
+                self.tree.insert("", "end", iid=b["id"],
+                                 values=(b["id"], "已停用", "—", "—", "—", b["desc"]),
+                                 tags=("off_row",))
+                continue
             val = (st or {}).get(b["state_key"], "?")
             real = self._real_for(b, pv)
             ip = self._ip_for(b, pv)
@@ -2154,6 +2449,7 @@ class App:
             ("kind", "类型", "combo", BUCKET_KINDS),
             ("account", "账号", "entry"),
             ("owner", "所属（账号身份，如 自己/室友A）", "entry"),
+            ("enabled", "启用（取消勾选 = 停用该桶）", "check"),
             ("mac", "MAC", "mac"),
             ("desc", "说明", "entry"),
             ("color", "颜色（可选）", "entry"),
@@ -2193,7 +2489,8 @@ class App:
             w.destroy()
         ttk.Label(f, text=(
             "桶 = 一条独立会话出口。这里可直接增 / 删 / 改 / 排序并写回配置文件"
-            "（保存前自动备份）；「改 MAC」既改配置字段，也可下发到网卡 / 接口。"),
+            "（保存前自动备份）；「改 MAC」既改配置字段，也可下发到网卡 / 接口；"
+            "「停用/启用」= 该桶不再探测与执行动作（生产端也会跳过），定义保留。"),
             wraplength=self.px(900), justify="left").pack(anchor="w", padx=self.px(4),
                                                           pady=self.px(2))
         cols = (("id", "桶", 90), ("kind", "类型", 60), ("account", "账号", 110),
@@ -2208,13 +2505,15 @@ class App:
         self.tree_bm.pack(fill="both", expand=True, padx=self.px(4), pady=self.px(2))
         self.tree_bm.bind("<Double-1>", lambda _e: self._bm_edit())
         self.tree_bm.tag_configure("dirty", foreground="#c62828")
+        self.tree_bm.tag_configure("off", foreground="#8d8d8d")
         ToolTip(self.tree_bm, "双击行 = 编辑；「改 MAC」可同时改配置字段并下发到接口")
 
         bar = ttk.Frame(f)
         bar.pack(fill="x", padx=self.px(4), pady=(self.px(2), 0))
         for text, cb, w in (("新增桶", self._bm_add, 9), ("编辑", self._bm_edit, 7),
                             ("删除", self._bm_del, 7), ("上移", self._bm_up, 6),
-                            ("下移", self._bm_down, 6), ("改 MAC", self._bm_mac, 9)):
+                            ("下移", self._bm_down, 6), ("改 MAC", self._bm_mac, 9),
+                            ("停用/启用", self._bm_toggle, 10)):
             ttk.Button(bar, text=text, width=w, command=cb).pack(side="left",
                                                                  padx=self.px(2))
         bar2 = ttk.Frame(f)
@@ -2248,11 +2547,15 @@ class App:
         for i, b in enumerate(self.bm_buckets):
             probe = b.get("probe") or {}
             renew = b.get("renew") or {}
+            off = not b.get("enabled", True)
+            bid = b.get("id") or "?"
             tr.insert("", "end", iid="bm%d" % i, values=(
-                b.get("id") or "?", b.get("kind") or "self", b.get("account") or "—",
+                (bid + "  (停用)") if off else bid,
+                b.get("kind") or "self", b.get("account") or "—",
                 b.get("mac") or "—", probe.get("mode") or "local",
                 renew.get("mode") or "none", b.get("speed_leg") or "—",
-                b.get("desc") or ""), tags=("dirty",) if b.get("_dirty") else ())
+                b.get("desc") or ""),
+                tags=("off",) if off else (("dirty",) if b.get("_dirty") else ()))
         if self.bm_dirty:
             self.lbl_bm.config(text="有未保存的改动（红字）", foreground="#c62828")
         else:
@@ -2322,6 +2625,23 @@ class App:
             return
         self.bm_buckets.pop(idx)
         self._bm_touch()
+
+    def _bm_toggle(self):
+        """桶管理页「停用/启用」：翻转内存记录并标红，点「保存到配置」后生效。"""
+        idx = self._bm_pick("停用/启用")
+        if idx is None:
+            return
+        b = self.bm_buckets[idx]
+        cur = bool(b.get("enabled", True))
+        if cur:
+            if not messagebox.askyesno(
+                    "停用桶",
+                    "确认停用桶 %s？\n停用后：不探测、不执行动作、生产端（probe_buckets.py）也会跳过；"
+                    "定义与配置保留，可随时重新启用。\n（点「保存到配置」后才真正生效）"
+                    % (b.get("id") or "?")):
+                return
+        b["enabled"] = not cur
+        self._bm_touch(idx)
 
     def _bm_move(self, delta):
         idx = self._bm_pick("移动桶")
@@ -2698,22 +3018,36 @@ class App:
 
         # ① 每桶快捷操作
         fA = sec("① 每桶快捷操作（探测 / 判定 / 续连 / 测速 —— 克隆腿受「真机闸」约束）")
+        self.ops_bucket_btns = {}
         for b in self.cfg.buckets:
             row = ttk.Frame(fA)
             row.pack(fill="x", padx=self.px(2), pady=self.px(1))
-            ttk.Label(row, text="%s  %s" % (b["id"], b["account"] or "—"), width=18,
-                      anchor="w").pack(side="left")
+            on = b.get("enabled", True)
+            ttk.Label(row, text="%s  %s%s" % (b["id"], b["account"] or "—",
+                                              "" if on else "  ⏸已停用"),
+                      width=22, anchor="w",
+                      foreground=("#8d8d8d" if not on else "")).pack(side="left")
             st = ttk.Label(row, text="—", width=10, anchor="w", foreground="#666")
             st.pack(side="left")
+            btns = []
             for btext, cb in (("详情", lambda x=b: self._bucket_detail(x)),
                               ("204探测", lambda x=b: self._act_op_probe(x)),
                               ("刷新真机", lambda x=b: self._act_op_real(x)),
                               ("续连/恢复", lambda x=b: self._act_op_renew(x)),
                               ("单桶测速", lambda x=b: self._act_op_speed(x))):
-                ttk.Button(row, text=btext, width=9,
-                           command=cb).pack(side="left", padx=self.px(1))
+                btn = ttk.Button(row, text=btext, width=9, command=cb)
+                btn.pack(side="left", padx=self.px(1))
+                btns.append(btn)
+            # 停用桶：动作按钮统一置灰（详情仍可看）
+            if not on:
+                for btn in btns[1:]:
+                    try:
+                        btn.state(["disabled"])
+                    except Exception:
+                        pass
             ToolTip(st, self._op_row_tip(b))
             self.ops_bucket_state[b["id"]] = st
+            self.ops_bucket_btns[b["id"]] = btns
 
         # ② 聚合出口（本机）
         fB = sec("② 聚合出口（本机 · 多会话出口合并 / TUN 接管）")
@@ -2819,8 +3153,11 @@ class App:
                    command=self.act_refresh_portal).pack(anchor="w", padx=self.px(2),
                                                          pady=self.px(2))
 
-        # ⑥ 纪律提示
-        fZ = ttk.LabelFrame(inner, text="⑥ 纪律提示（互顶闸 · 生命周期）")
+        # ⑥ 分流熔断
+        self._breaker_build(inner, sec)
+
+        # ⑦ 纪律提示
+        fZ = ttk.LabelFrame(inner, text="⑦ 纪律提示（互顶闸 · 生命周期）")
         ttk.Label(fZ, justify="left", anchor="w", wraplength=self.px(900), text=(
             "· 克隆腿续连前必须先看「真机判定」：目标真机在线 → 拦截；判定不了 → 也拦截（不主动撞人）。\n"
             "· 关停承载克隆腿的虚拟路由，会同时断掉该机上的所有腿（重新开机 + 续约后自愈）。\n"
@@ -2859,8 +3196,163 @@ class App:
             lbl = self.ops_bucket_state.get(b["id"])
             if not lbl:
                 continue
+            if not b.get("enabled", True):
+                lbl.config(text="已停用", foreground="#8d8d8d")
+                continue
             val = st.get(b["state_key"], "?")
             lbl.config(text=STATUS_TEXT.get(val, val), foreground=COLORS.get(str(val), "#333"))
+
+    # ---- ⑥ 分流熔断（P10 · 2026-09-09 由内部测试版通用化回灌） ----
+    def _breaker_build(self, parent, sec):
+        """按桶丢包采样 → 连续超阈值自动隔离 / 连续达标自动恢复。"""
+        s = self.cfg.aggregation.get("breaker") or {}
+        if not _BR["inited"]:
+            breaker_load(self.cfg)
+            _BR["inited"] = True
+        fBk = sec("⑥ 分流熔断（按桶丢包采样 · 连续超阈值自动隔离 / 连续达标自动恢复）")
+        rowA = ttk.Frame(fBk)
+        rowA.pack(fill="x", padx=self.px(2), pady=self.px(2))
+        self.var_br_on = tk.BooleanVar(value=bool(s.get("enabled", True)))
+        ttk.Checkbutton(rowA, text="启用熔断", variable=self.var_br_on,
+                        command=self._act_breaker_toggle).pack(side="left")
+        ttk.Label(rowA, text=("阈值 ≥%s%% 连续 %s 轮隔离 · ≤%s%% 连续 %s 轮恢复 · "
+                              "间隔 %ss · 每轮 %s 次探测 · 至少保留 %s 条腿"
+                              % (s.get("threshold_pct", 50), s.get("trip_after", 2),
+                                 s.get("recover_below_pct", 10), s.get("recover_after", 3),
+                                 s.get("interval_s", 60), s.get("tries", 5),
+                                 s.get("keep_min", 1))), foreground="#666"
+                  ).pack(side="left", padx=self.px(4))
+        ttk.Button(rowA, text="立即检查", width=10,
+                   command=self._act_breaker_check).pack(side="right", padx=self.px(1))
+        ttk.Button(rowA, text="重置状态", width=10,
+                   command=self._act_breaker_reset).pack(side="right", padx=self.px(1))
+        self.ops_br_note = ttk.Label(fBk, text="—", anchor="w", foreground="#666",
+                                     wraplength=self.px(900), justify="left")
+        self.ops_br_note.pack(fill="x", padx=self.px(4), pady=(0, self.px(2)))
+        self.ops_br_rows = {}
+        for b in self.cfg.buckets:
+            row = ttk.Frame(fBk)
+            row.pack(fill="x", padx=self.px(2), pady=self.px(1))
+            ttk.Label(row, text=b["id"], width=8, anchor="w").pack(side="left")
+            loss = ttk.Label(row, text="丢包 —", width=12, anchor="w")
+            loss.pack(side="left")
+            state = ttk.Label(row, text="—", width=10, anchor="w")
+            state.pack(side="left")
+            ttk.Label(row, text="%s / %s" % (b["account"] or "—", b["desc"] or ""),
+                      anchor="w").pack(side="left", fill="x", expand=True)
+            ttk.Button(row, text="恢复", width=6,
+                       command=lambda x=b: self._act_breaker_manual(x, False)
+                       ).pack(side="right", padx=self.px(1))
+            ttk.Button(row, text="隔离", width=6,
+                       command=lambda x=b: self._act_breaker_manual(x, True)
+                       ).pack(side="right", padx=self.px(1))
+            self.ops_br_rows[b["id"]] = (loss, state)
+        ttk.Label(fBk, justify="left", foreground="#8d8d8d", wraplength=self.px(900), text=(
+            "判定在本控制台，执行完全走配置里的 actions.isolate_leg / restore_leg"
+            "（可用 {bucket} {account} {leg} {loss} 占位符）；未配置则只记录状态并提示。\n"
+            "⚠️ 熔断采样只在「高级界面」运行时进行（简单界面/托盘运行期间不采样）。"
+        )).pack(anchor="w", padx=self.px(4), pady=(0, self.px(2)))
+        while self._breaker_render in _BR_RENDER_CBS:
+            _BR_RENDER_CBS.remove(self._breaker_render)
+        _BR_RENDER_CBS.append(self._breaker_render)
+        if self.breaker_runner is None:
+            self.breaker_runner = BreakerRunner(self)
+        self._breaker_render()
+
+    def _breaker_render(self):
+        rows = getattr(self, "ops_br_rows", None)
+        if not rows:
+            return
+        for bid, (loss_lbl, state_lbl) in rows.items():
+            loss = _BR["last"].get(bid, "—")
+            try:
+                loss_lbl.config(text="丢包 %s" % ("—" if loss is None else "%s%%" % loss))
+            except Exception:
+                pass
+            try:
+                if bid in _BR["tripped"]:
+                    state_lbl.config(text="已隔离", foreground="#b00")
+                else:
+                    state_lbl.config(text="正常", foreground="#1a7f37")
+            except Exception:
+                pass
+        try:
+            self.ops_br_note.config(
+                text="状态：%s%s" % (_BR["note"],
+                                    ("（%s）" % _BR["time"]) if _BR["time"] else ""))
+        except Exception:
+            pass
+        try:
+            if self.var_br_on.get() != bool(
+                    (self.cfg.aggregation.get("breaker") or {}).get("enabled", True)):
+                self.var_br_on.set(
+                    bool((self.cfg.aggregation.get("breaker") or {}).get("enabled", True)))
+        except Exception:
+            pass
+
+    def _act_breaker_toggle(self):
+        want = bool(self.var_br_on.get())
+        try:
+            save_config_keys(self.cfg, {"aggregation.breaker.enabled": want})
+        except Exception as e:  # noqa: BLE001
+            self.var_br_on.set(not want)
+            messagebox.showerror("分流熔断", "写入配置失败：%s" % e)
+            return
+        reload_config_inplace(self)
+        if self.breaker_runner is None:
+            self.breaker_runner = BreakerRunner(self)
+        if want:
+            self.breaker_runner.start()
+        elif self.breaker_runner._after:
+            try:
+                self.root.after_cancel(self.breaker_runner._after)
+            except Exception:
+                pass
+            self.breaker_runner._after = None
+        self._log_bind("breaker: %s" % ("已启用" if want else "已停用（不再采样）"))
+        self._breaker_render()
+
+    def _act_breaker_check(self):
+        if self.breaker_runner is None:
+            self.breaker_runner = BreakerRunner(self)
+        threading.Thread(target=self.breaker_runner.run_once, daemon=True).start()
+
+    def _act_breaker_reset(self):
+        if not messagebox.askyesno("重置熔断状态",
+                                   "清空丢包采样与「已隔离」标记？\n"
+                                   "（不会自动把已摘的腿加回去，需要时点「恢复」）"):
+            return
+        _BR["last"], _BR["fail"], _BR["ok"] = {}, {}, {}
+        _BR["tripped"] = set()
+        _BR["note"] = "已重置采样状态"
+        breaker_save(self.cfg)
+        self._breaker_render()
+
+    def _act_breaker_manual(self, bucket, isolate):
+        name = "isolate_leg" if isolate else "restore_leg"
+        verb = "隔离" if isolate else "恢复"
+        if not messagebox.askyesno("%s %s" % (verb, bucket["id"]),
+                                   "%s桶 %s（%s）？\n\n执行动作：%s"
+                                   % (verb, bucket["id"], bucket["account"] or "—", name)):
+            return
+        if not self.cfg.action(name):
+            messagebox.showinfo(verb, "未配置 actions.%s —— 请在配置里填一条命令\n"
+                                      "（可用 {bucket} {account} {leg} {loss} 占位符）。" % name)
+            return
+
+        def work():
+            rc, out = exec_action(self.cfg, name, bucket, loss="manual")
+            if isolate:
+                _BR["tripped"].add(bucket["id"])
+            else:
+                _BR["tripped"].discard(bucket["id"])
+            _BR["fail"][bucket["id"]] = 0
+            _BR["ok"][bucket["id"]] = 0
+            _BR["note"] = "手动%s %s → rc=%s" % (verb, bucket["id"], rc)
+            breaker_save(self.cfg)
+            self._render_async()
+        self._log_bind("breaker: 手动%s %s" % (verb, bucket["id"]))
+        threading.Thread(target=work, daemon=True).start()
 
     def _fill_ops(self):
         self._set_ops_bucket_state()
@@ -2963,8 +3455,19 @@ class App:
         if not open_path(self.cfg.data_dir):
             messagebox.showinfo("打开目录", "未配置聚合出口目录（aggregation.dir）。")
 
+    def _ensure_bucket_on(self, bucket, verb):
+        """停用桶拦截：探测/判定/续连/测速等动作一律拒绝（2026-09-09）。"""
+        if bucket.get("enabled", True):
+            return True
+        messagebox.showwarning(
+            verb, "桶 %s 已停用。\n停用桶不参与探测/判定/续连/测速；"
+                  "如需操作请先到「桶管理」页重新启用并保存。" % bucket["id"])
+        return False
+
     def _act_op_probe(self, bucket):
         """204 探测：只读，识别门户劫持。"""
+        if not self._ensure_bucket_on(bucket, "204 探测"):
+            return
         if PB is None:
             messagebox.showerror("204 探测", "缺少探测模块 probe_buckets.py：%s" % PB_ERR)
             return
@@ -2998,6 +3501,8 @@ class App:
 
     def _act_op_real(self, bucket):
         """刷新门户并显示该桶的真机判定（克隆腿的关键闸）。"""
+        if not self._ensure_bucket_on(bucket, "刷新真机判定"):
+            return
         if not self.cfg.has_action("refresh_portal"):
             messagebox.showinfo("刷新真机判定",
                                 "未配置 actions.refresh_portal：请指向你的门户查询脚本。")
@@ -3059,6 +3564,8 @@ class App:
 
     def _act_op_renew(self, bucket):
         """按桶恢复：ssh_ifup（可带真机闸）/ 自定义命令 / 无需手动。"""
+        if not self._ensure_bucket_on(bucket, "续连"):
+            return
         renew = bucket["renew"]
         mode = renew["mode"]
         if mode == "none":
@@ -3120,6 +3627,8 @@ class App:
         self._run_bg(f)
 
     def _act_op_speed(self, bucket):
+        if not self._ensure_bucket_on(bucket, "单桶测速"):
+            return
         if not self.cfg.has_action("speedtest"):
             messagebox.showinfo("单桶测速", "未配置 actions.speedtest。")
             return
@@ -3447,47 +3956,8 @@ class App:
             messagebox.showerror("配置", "打开失败: %s" % e)
 
     def reload_config(self):
-        """保存配置后就地热更新（不重建窗口）。返回 (即时生效数, 需重启数)。
-
-        做法：重新 load_config 一次，把「可变的字典段」原地 clear+update，
-        这样所有持有 self.cfg 引用的界面代码立即读到新值；
-        路径类标量（data_dir/state_file/...）当前窗口已按旧值初始化 → 计数为「需重启」。
-        """
-        live = restart = 0
-        try:
-            fresh = load_config(self.cfg.path)
-        except Exception as e:  # noqa: BLE001
-            try:
-                self._log_bind("reload_config 失败: %s" % e)
-            except Exception:
-                pass
-            return 0, 0
-        for attr in ("ui", "probe", "aggregation", "portal", "vm", "lifecycle"):
-            lv = getattr(self.cfg, attr, None)
-            nv = getattr(fresh, attr, None)
-            if isinstance(lv, dict) and isinstance(nv, dict):
-                if lv != nv:
-                    live += sum(1 for k in set(lv) | set(nv) if lv.get(k) != nv.get(k))
-                lv.clear()
-                lv.update(nv)
-        if self.cfg.tasks != fresh.tasks:
-            live += 1
-        self.cfg.tasks = fresh.tasks
-        self.cfg.raw = fresh.raw
-        for attr in ("data_dir", "state_file", "portal_file", "events_file",
-                     "speedtest_result"):
-            if getattr(self.cfg, attr, "") != getattr(fresh, attr, ""):
-                setattr(self.cfg, attr, getattr(fresh, attr, ""))
-                restart += 1
-        try:
-            self.root.title(self.cfg.ui["title"])
-        except Exception:
-            pass
-        try:
-            self.refresh()
-        except Exception:
-            pass
-        return live, restart
+        """保存配置后就地热更新（见模块级 reload_config_inplace）。"""
+        return reload_config_inplace(self)
 
     def act_speedtest(self):
         self._run_speedtest()
@@ -3537,9 +4007,10 @@ class App:
             "「账号密码」页：录入并确认后仅显示 %s 且锁定；明文永不落盘；"
             "脚本调用接口时才解密取用。\n"
             "「桶管理」页：新增/编辑/删除/排序桶 → 保存到配置（自动备份）；"
-            "「改 MAC」= 改配置字段 + 可下发到接口（actions.set_mac）。\n"
+            "「改 MAC」= 改配置字段 + 可下发到接口（actions.set_mac）；"
+            "桶可「停用/启用」（停用后不探测、不动作、界面置灰）。\n"
             "「运维总控」页：①每桶操作 ②聚合出口 ③虚拟路由(可选) ④计划任务 "
-            "⑤门户凭据 ⑥纪律提示\n"
+            "⑤门户凭据 ⑥分流熔断 ⑦纪律提示\n"
             "生命周期：本控制台 = 总开关。退出 = 全链停；启动自动拉起；UI 不在则任务停手。"
             % (buckets_txt, cfg.path, cfg.data_dir, miss_txt, STARS)
         )
@@ -3770,6 +4241,9 @@ class SimpleApp:
                   font=("TkDefaultFont", 11, "bold")).pack(side="left")
         self.lbl_fresh = ttk.Label(top, text="")
         self.lbl_fresh.pack(side="left", padx=(self.px(8), 0))
+        # 配置入口（2026-09-09）：此前只在高级界面工具栏，简单界面/托盘都没有
+        ttk.Button(top, text="配置", width=7,
+                   command=self.act_config).pack(side="right", padx=(self.px(4), 0))
         ttk.Button(top, text="高级界面", width=10,
                    command=self.open_advanced).pack(side="right")
 
@@ -4083,6 +4557,18 @@ class SimpleApp:
         except Exception:
             pass
 
+    # ---------- 配置 ----------
+    def act_config(self):
+        """打开配置编辑对话框（简单界面入口，2026-09-09 补齐）。"""
+        try:
+            open_config_dialog(self)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("配置", "打开失败: %s" % e)
+
+    def reload_config(self):
+        """保存配置后就地热更新（见模块级 reload_config_inplace）。"""
+        return reload_config_inplace(self)
+
     # ---------- 高级界面 ----------
     def open_advanced(self):
         if self.adv_win is None or not self.adv_win.winfo_exists():
@@ -4175,6 +4661,7 @@ def build_simple_tray(app, root, cfg):
                 0, lambda: app.act_vpn(True))),
             pystray.MenuItem("关闭 VPN 代理", lambda i, item: root.after(
                 0, lambda: app.act_vpn(False))),
+            pystray.MenuItem("配置", lambda i, item: root.after(0, app.act_config)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出(全链停)", lambda i, item: root.after(0, app.act_quit)),
         ))
