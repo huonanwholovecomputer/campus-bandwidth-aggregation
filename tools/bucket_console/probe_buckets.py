@@ -40,11 +40,39 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 DEVNULL = os.devnull
 
 
-def run(argv, timeout=20, shell=False):
-    """执行命令并返回 (rc, stdout)。rc=None 表示超时/异常。"""
+# 宿主机代理变量：探活子进程必须剥离，理由见 probe_env()。
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                   "http_proxy", "https_proxy", "all_proxy",
+                   "NO_PROXY", "no_proxy")
+
+
+def probe_env():
+    """探活子进程的环境：剥掉宿主机代理变量（返回副本，不改动本进程）。
+
+    为什么必须剥：探活要量的是「这条桶自己的出口」。聚合出口（mihomo 等）的
+    mixed-port 是本机回环端口；若使用者不走 TUN 而是把系统 / 环境变量代理指向它，
+    代理一停端口就没人监听、变量却还留着 —— curl 会把请求发给那个死端口，立刻
+    「连接被拒绝」（Windows WinError 10061），探活全变 000 → 桶被误判 loss、
+    甚至触发熔断摘腿，而链路其实完好。
+
+    为什么不用 `curl --noproxy '*'` 代替：实测它会连显式 `-x socks5h://…` 一起废掉
+    （死 socks 也能返回 200），等于把 SOCKS 探活静默降级成宿主机直连 —— 那是更危险
+    的假阳性。剥环境变量只影响「隐式代理」，显式 `-x` 仍然生效。
+    """
+    env = dict(os.environ)
+    for k in _PROXY_ENV_KEYS:
+        env.pop(k, None)
+    return env
+
+
+def run(argv, timeout=20, shell=False, env=None):
+    """执行命令并返回 (rc, stdout)。rc=None 表示超时/异常。
+
+    env 传 probe_env() 即绕开宿主机代理（探活用；显式 -x 不受影响）。
+    """
     try:
         r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, shell=shell,
+                           errors="replace", timeout=timeout, shell=shell, env=env,
                            creationflags=NO_WINDOW)
         return r.returncode, (r.stdout or "").strip()
     except subprocess.TimeoutExpired:
@@ -148,14 +176,17 @@ def probe_bucket(cfg, bucket, tries=None, timeout=None, target=None):
                     "http_loss": None, "icmp_loss": None}
         iface = pr.get("iface") or ""
         iface_arg = ("--interface %s " % iface) if iface else ""
+        # 远端 curl 也显式 --noproxy：设备侧若残留代理变量，同样会把探活带偏。
+        # （远端这里只用 --interface 选源，不用 -x，所以 --noproxy 不会误伤显式代理。）
         for _ in range(tries):
             rc, out = run(ssh_argv(ssh_cfg,
-                                   "curl -s -m %d -o /dev/null -w '%%{http_code}' %s%s"
+                                   "curl -s -m %d --noproxy '*' -o /dev/null -w '%%{http_code}' %s%s"
                                    % (timeout, iface_arg, tgt)),
                           timeout=timeout + 12)
             codes.append(out if (out and out.isdigit()) else "000")
         if any(c != "204" for c in codes):
-            rc, body = run(ssh_argv(ssh_cfg, "curl -s -m %d %s%s" % (timeout, iface_arg, tgt)),
+            rc, body = run(ssh_argv(ssh_cfg,
+                                    "curl -s -m %d --noproxy '*' %s%s" % (timeout, iface_arg, tgt)),
                            timeout=timeout + 12)
             body = body if rc == 0 else ""
         if iface:
@@ -170,19 +201,20 @@ def probe_bucket(cfg, bucket, tries=None, timeout=None, target=None):
             return {"codes": [], "state": "n/a", "portal": False, "body": "",
                     "detail": "socks 探测缺少 probe.socks（不猜本机直连，避免误判为在线）",
                     "http_loss": None, "icmp_loss": None}
+        env = probe_env()          # 绕开宿主机代理（显式 -x 不受影响）
         for _ in range(tries):
             args = base + ["-o", DEVNULL, "-w", "%{http_code}"]
             if socks and not is_unset(socks):
                 args += ["-x", socks]
             args.append(tgt)
-            rc, out = run(args, timeout=timeout + 6)
+            rc, out = run(args, timeout=timeout + 6, env=env)
             codes.append(out if (out and out.isdigit()) else "000")
         if any(c != "204" for c in codes):
             args = base
             if socks and not is_unset(socks):
                 args += ["-x", socks]
             args.append(tgt)
-            rc, body = run(args, timeout=timeout + 6)
+            rc, body = run(args, timeout=timeout + 6, env=env)
             body = body if rc == 0 else ""
 
     markers = cfg.probe.get("portal_markers") or []

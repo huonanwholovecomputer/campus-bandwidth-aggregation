@@ -140,6 +140,8 @@ python bucket_console.py --config config.private.json
 | `ssh` | `ssh <host> curl --interface <iface> ...` | 远端接口（如路由器 ethX） |
 | `none` | 不探测（保留上次状态） | 只看状态、不做探测的桶 |
 
+> **探活一律绕开宿主机代理**：`probe_buckets.py` 跑 curl/ssh 时会剥掉 `HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY`（`probe_env()`）。否则当你在宿主机上把系统/环境变量代理指向聚合出口（`mixed-port`）之后又把聚合停掉，探活会全变 `000`（连的是没人监听的回环端口，`WinError 10061`），把「宿主机代理挂了」误报成「这条腿挂了」。注意这里**不能**用 `curl --noproxy '*'` 代替 —— 它会把显式 `-x socks5h://…` 也一起废掉，让 SOCKS 探活悄悄变成宿主机直连。详见 [docs/04_健壮性设计.md](../../docs/04_健壮性设计.md) 的 F12。
+
 ### 3.2 桶的续连方式 `renew.mode`
 
 | 值 | 行为 |
