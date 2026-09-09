@@ -1,0 +1,240 @@
+{
+  "_readme": [
+    "多桶聚合控制台 · 配置模板（脱敏版）。",
+    "用法：复制本文件为 config.private.json（该命名已被 .gitignore 的 *.private.* 忽略），",
+    "把下面所有 <占位符> 换成你自己的值，然后：",
+    "  python bucket_console.py --config config.private.json --check   # 先自检",
+    "  python bucket_console.py --config config.private.json           # 再开界面",
+    "凡是留空或仍是 <占位符> 的项，界面会显示「未配置」并给出提示，不会报错。",
+    "所有按钮背后的动作都是你自己写的命令 —— 本工具不实现任何认证/协议逻辑。"
+  ],
+  "_notes": {
+    "占位符": "{config} {data_dir} {bucket} {account} {leg} {iface} {wan} {target} 可在动作命令里使用",
+    "命令写法": "argv 用列表（推荐，不经 shell）；也可用字符串（走 shell）",
+    "探测方式": "probe.mode = local(本机) / socks(经 SOCKS 出口) / ssh(远端接口) / none(不探测)",
+    "续连方式": "renew.mode = ssh_ifup(执行 ifup <wan>) / command(执行 renew_bucket 动作) / none",
+    "真机闸": "克隆桶 renew.gate=true 时，续连前必须先刷新门户判定：目标真机在线或判定不了 → 拦截",
+    "所属": "buckets[].owner = 该桶账号的身份标签（自己/室友A…）；账号密码页的「所属」列就取它",
+    "未配置项": "probe.target / aggregation.api / 各 actions 都可留空；控制台会自动降级并提示"
+  },
+
+  "app": {
+    "_note": "数据目录：状态文件、事件日志、心跳、凭据库都放这里",
+    "data_dir": "~/.bucket_console",
+    "state_file": "state.json",
+    "portal_file": "portal_status.json",
+    "events_file": "console_events.log",
+    "speedtest_result": "speedtest.json"
+  },
+
+  "ui": {
+    "title": "多桶聚合控制台 · 连接管理",
+    "tray_title": "多桶聚合 · 总开关",
+    "interval_ms": 15000,
+    "spark_samples": 240,
+    "window_w": 1000,
+    "window_h": 860,
+    "mono_font": "Consolas"
+  },
+
+  "lifecycle": {
+    "_note": "UI = 总开关：启动拉起、退出全链停；配套任务建议以心跳文件为门控",
+    "heartbeat_file": "ui_alive.json",
+    "boot_action": "boot_chain",
+    "boot_delay_ms": 3000,
+    "stop_action": "stop_chain",
+    "teardown_stamp": "teardown.stamp",
+    "on_start_remove": ["teardown.stamp"],
+    "exit_confirm": "退出后控制台会执行「全链停」：\n  · 按配置停掉虚拟路由 / 聚合出口等受管服务\n  · 撤除 UI 心跳（配套任务随即停手）\n\n确认退出？"
+  },
+
+  "probe": {
+    "_note": "探活：3 次取 204；未拿到 204 且响应体命中门户标记 → 判定「门户劫持」",
+    "_loss_note": "丢包率：HTTP 层 = 未拿到 204 的比例；ICMP 层 = ping 汇总行的百分比（SOCKS 出口无法 ICMP）",
+    "target": "<探活目标URL>",
+    "curl": "curl",
+    "portal_markers": ["WISPAccessGatewayParam", "NextURL"],
+    "icmp": true,
+    "icmp_count": 5,
+    "ping_host": ""
+  },
+
+  "aggregation": {
+    "_note": "聚合出口的 REST 控制面（可选）。填了才会显示「聚合腿组」卡片与代理开关",
+    "api": "http://<控制API地址>",
+    "group": "<聚合组名>",
+    "provider": "<节点源文件名>",
+    "direct_members": ["DIRECT", "<直连节点名>"],
+    "mode_file": "aggregator_mode.txt",
+    "restart_action": "restart_aggregator",
+    "proxy_enabled": true,
+    "dir": "<聚合出口配置目录>"
+  },
+
+  "portal": {
+    "_note": "门户查询产物与凭据文件约定（产物由你的门户查询脚本写入 app.portal_file）",
+    "global_tok_file": "portal_tok.txt",
+    "per_account_pattern": "portal_tok_{account}.txt",
+    "tok_dir": ".",
+    "owner_field": "tokenOwner",
+    "accounts": ["<账号甲>", "<账号乙>"]
+  },
+
+  "vm": {
+    "_note": "可选的虚拟路由（承载克隆腿）。enabled=false 时「运维总控」不显示该区块",
+    "enabled": false,
+    "label": "虚拟路由",
+    "note": "关机将同时断开其承载的所有克隆腿；重新开机 + 续约后自愈。"
+  },
+
+  "buckets": [
+    {
+      "id": "A",
+      "label": "本机有线 · 无感",
+      "state_key": "b_a",
+      "kind": "self",
+      "account": "<账号甲>",
+      "owner": "自己",
+      "mac": "<MAC_A>",
+      "desc": "<物理WAN接口> · 本机直连",
+      "color": "#4a90d9",
+      "speed_leg": "A-direct",
+      "probe": { "mode": "local", "tries": 3, "timeout": 6 },
+      "renew": { "mode": "none", "hint": "本机腿由保活脚本维持，无需手动续连；怀疑掉线请点「204探测」。" }
+    },
+    {
+      "id": "B",
+      "label": "路由器第二会话",
+      "state_key": "b_b",
+      "kind": "self",
+      "account": "<账号甲>",
+      "mac": "<MAC_B>",
+      "desc": "<LAN接口> · 经路由器出口",
+      "color": "#3cb371",
+      "speed_leg": "B-socks",
+      "probe": {
+        "mode": "socks",
+        "socks": "socks5h://<OpenWrt管理IP>:<SOCKS端口-A>",
+        "tries": 3,
+        "timeout": 6
+      },
+      "renew": {
+        "mode": "ssh_ifup",
+        "wan": "<物理WAN接口>",
+        "iface": "<接口名>",
+        "ssh": { "host": "<OpenWrt管理IP>", "user": "root", "key": "<私钥路径>", "timeout": 10 },
+        "gate": false,
+        "owner_label": "本机第二会话"
+      }
+    },
+    {
+      "id": "C",
+      "label": "手机桶 · 克隆无感",
+      "state_key": "b_c",
+      "kind": "clone",
+      "account": "<账号甲>",
+      "mac": "<设备MAC>",
+      "desc": "<接口名> · 克隆手机真机标识",
+      "color": "#d9a13c",
+      "speed_leg": "C-eth3",
+      "probe": {
+        "mode": "ssh",
+        "iface": "<接口名>",
+        "ssh": { "host": "<OpenWrt管理IP>", "user": "root", "key": "<私钥路径>", "timeout": 10 },
+        "tries": 3,
+        "timeout": 6
+      },
+      "renew": {
+        "mode": "ssh_ifup",
+        "wan": "<出口接口B>",
+        "iface": "<接口名>",
+        "ssh": { "host": "<OpenWrt管理IP>", "user": "root", "key": "<私钥路径>", "timeout": 10 },
+        "gate": true,
+        "owner_label": "手机真机"
+      },
+      "clone": {
+        "portal_id": "c1",
+        "gate": true,
+        "owner_label": "手机真机",
+        "expect_whitelist": true
+      }
+    }
+  ],
+
+  "actions": {
+    "_note": "每个动作 = 一条命令。argv 列表优先；null 表示未配置（界面会提示）",
+    "refresh_state": {
+      "desc": "重新巡检：跑状态生产端，回写状态文件",
+      "cwd": ".",
+      "timeout": 180,
+      "argv": ["python", "probe_buckets.py", "--config", "{config}"]
+    },
+    "refresh_portal": {
+      "desc": "门户刷新：跑你的门户查询脚本，产物写入 app.portal_file",
+      "timeout": 120,
+      "argv": null
+    },
+    "restart_aggregator": {
+      "desc": "重启聚合出口（会短暂抖动）",
+      "timeout": 180,
+      "confirm": "将重启聚合出口：网络会短暂抖动（数秒），TUN 恢复后自动继续。继续？",
+      "argv": null
+    },
+    "refresh_provider": {
+      "desc": "刷新节点源文件（之后需重启聚合才生效）",
+      "timeout": 120,
+      "argv": null
+    },
+    "open_aggregator_dir": {
+      "desc": "打开聚合出口配置目录（未配置 aggregation.dir 时才用）",
+      "argv": null
+    },
+    "speedtest": {
+      "desc": "测速：全量时把 {leg} 留空；单桶测速时控制台会传入该桶的 speed_leg",
+      "timeout": 300,
+      "argv": null
+    },
+    "set_mac": {
+      "desc": "改 MAC 下发：把 {mac} 写到 {iface}（可用 {bucket} {wan}）。留空则界面只改配置字段",
+      "timeout": 60,
+      "confirm": "将把 {mac} 下发到 {iface}（会短暂断链，随后按配置续约）。继续？",
+      "argv": null
+    },
+    "boot_chain": {
+      "desc": "启动拉起：拉起虚拟路由 / 聚合出口（幂等）",
+      "timeout": 180,
+      "argv": null
+    },
+    "stop_chain": {
+      "desc": "退出全链停：停掉受管服务",
+      "timeout": 180,
+      "argv": null
+    },
+    "renew_bucket": {
+      "desc": "自定义续连（renew.mode=command 的桶会调它；可用 {wan} {iface} {bucket}）",
+      "timeout": 120,
+      "argv": null
+    },
+    "vm_power_on": { "desc": "虚拟路由开机", "timeout": 180, "argv": null },
+    "vm_power_off": {
+      "desc": "虚拟路由关机（会断开其承载的克隆腿）",
+      "timeout": 180,
+      "confirm": "关机将同时断开该虚拟路由承载的所有克隆腿，直到重新开机 + 续约才恢复。继续？",
+      "argv": null
+    },
+    "vm_status": { "desc": "虚拟路由状态详情", "timeout": 60, "argv": null }
+  },
+
+  "tasks": [
+    {
+      "name": "<计划任务名-巡检>",
+      "desc": "每 2 分钟巡检，回写状态文件（建议以 UI 心跳为门控）",
+      "gate": "ui_heartbeat"
+    },
+    {
+      "name": "<计划任务名-保活>",
+      "desc": "保活无感会话（建议以 UI 心跳为门控）",
+      "gate": "ui_heartbeat"
+    }
+  ]
+}

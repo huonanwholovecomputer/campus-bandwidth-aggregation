@@ -8,3 +8,7 @@ Desktop.ini
 drafts/
 *.private.*
 *_real_*
+
+# Python 产物（控制台工具运行时生成）
+__pycache__/
+*.pyc

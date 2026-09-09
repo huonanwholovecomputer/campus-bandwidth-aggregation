@@ -1,0 +1,98 @@
+# =============================================================================
+# 模板：宿主侧"单账号双桶"聚合配置（mihomo 风格；脱敏模板）
+#
+# 【用途】
+#   在宿主机上用 mihomo 把两桶合并为一个出口：
+#     桶1（直连本体） = DIRECT + 绑定本机有线网卡（interface-name）
+#     桶2（同账号第二桶）= SOCKS5 → OpenWrt 上的 microsocks（见 openwrt_second_bucket.sh）
+#   二者组成 load-balance 组，所有应用流量按"连接"轮流分发 → 多连接应用吃满两桶。
+#   可选 TUN 模式把整机流量"单设备化"接管（Windows 需管理员权限）。
+#
+# 【前置条件】
+#   · 装有 mihomo（兼容经典 clash 配置格式，v1.18+）。
+#   · 桶1（直连本体）已在线（见 setup.md §1）；桶2 的 SOCKS 已在 OpenWrt 上就绪。
+#   · 本文件只做"合并"，不做任何认证。
+#   · 把下方全部 <> 占位符替换为你的环境值。
+#
+# 【占位符清单】
+#   <混合端口>          本地混合端口（HTTP/SOCKS5，如 7890）
+#   <控制API地址>       external-controller 地址（含端口，一般本机回环）
+#   <DNS监听地址>/<DNS监听端口>  DNS 服务监听地址与端口
+#   <DNS_IP>/<备用DNS_IP>       上游 DNS 服务器（公共或校网 DNS）
+#   <节点A-名称>/<节点A-接口名>  桶1：DIRECT + 本机有线网卡名
+#   <节点B-名称>/<节点B-服务器地址>/<节点B-端口>  桶2：OpenWrt 的 SOCKS5 出口
+#   <聚合组名>          双桶负载均衡策略组名
+#
+# 【风险提示】
+#   · 仅限自有账号 + 自有离线设备实验；遵守所在网络接入与使用规定，留意并发名额。
+#   · 负载均衡让连接分散到两个会话，认证 / 支付等对出口敏感的服务可能被风控，
+#     可把相关域名固定到单条出口（用 rule 先行匹配到单一节点）。
+#   · TUN 运维纪律（实测教训，务必遵守）：
+#     1. 禁用热重载：TUN 运行中通过外部控制器热重载会导致进程崩溃、TUN 路由
+#        残留 → 全网黑洞；改配置一律重启进程；
+#     2. 重启必须提权：非管理员（Windows）/ 非 root 重启后 TUN 创建被静默拒绝
+#        （tun.enable 实际不生效、虚拟网卡不存在）→ 流量悄悄退回直连单桶、聚合
+#        静默失效且不报错；重启前确认权限，重启后用 external-controller 或系统
+#        网卡列表核对 TUN 是否真的接管；
+#     3. 冷启动时序：桶2 在 OpenWrt VM 上，聚合代理应等 OpenWrt 的 SOCKS 端口
+#        就绪后再启动，否则 TUN 自动发现接口失败、桶2 不可用。
+#   · 先冒烟（tun.enable: false，只走 mixed-port）再开 TUN。
+#   · 本模板不含任何真实标识；占位符规范见 docs/00_脱敏与贡献规范.md。
+# =============================================================================
+
+mixed-port: <混合端口>
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: "<控制API地址>"
+
+# --- TUN：整机流量接管（冒烟测试先置 enable: false）---
+tun:
+  enable: true
+  stack: mixed                # Windows: mixed | system | gvisor
+  dns-hijack:
+    - any:53
+  auto-route: true
+  auto-detect-interface: true
+
+# --- DNS：国内解析，防污染 ---
+dns:
+  enable: true
+  listen: "<DNS监听地址>:<DNS监听端口>"
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+  nameserver:
+    - <DNS_IP>
+    - <备用DNS_IP>
+  default-nameserver:
+    - <DNS_IP>
+
+# --- 两个桶 ---
+proxies:
+  - name: "<节点A-名称>"            # 桶1：直连本体（本机有线网卡）
+    type: direct
+    interface-name: "<节点A-接口名>"
+  - name: "<节点B-名称>"            # 桶2：OpenWrt 上的 SOCKS 出口
+    type: socks5
+    server: "<节点B-服务器地址>"
+    port: <节点B-端口>
+    udp: true
+
+# --- 双桶负载均衡组 ---
+proxy-groups:
+  - name: "<聚合组名>"
+    type: load-balance
+    strategy: round-robin
+    proxies:
+      - "<节点A-名称>"
+      - "<节点B-名称>"
+
+# --- 规则 ---
+rules:
+  - GEOIP,private,DIRECT
+  - GEOSITE,cn,<聚合组名>
+  - GEOIP,CN,<聚合组名>
+  - MATCH,<聚合组名>

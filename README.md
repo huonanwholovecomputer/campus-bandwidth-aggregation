@@ -1,7 +1,7 @@
 # 校园网多设备带宽合并 · 原理研究（开源归档）
 
 > 校园网「多设备并发会话」带宽合并的技术原理研究归档。
-> 本仓库只讲**原理与可复用的通用实现套路**，不含任何真实账号、设备、MAC、厂商实现或校园网内部信息；所有配置模板均以占位符提供。
+> 本仓库只讲**原理与可复用的通用实现套路**，不与任何真实账号、设备、MAC、厂商实现或校园网内部信息；所有配置模板均以占位符提供。
 
 ## 这是什么
 
@@ -16,7 +16,9 @@
 | [docs/03_限速机制与等效带宽.md](docs/03_限速机制与等效带宽.md) | 单会话限速模型、合并等效带宽的推导与实测方法论 |
 | [docs/04_健壮性设计.md](docs/04_健壮性设计.md) | keepalive、断线自愈、白名单巡检、故障模式清单 |
 | [templates/](templates/) | 可复用配置模板（全部占位符化） |
+| [tools/bucket_console/](tools/bucket_console/) | **多桶聚合控制台**（多桶合一 · 托盘 + 全操控界面）：只读状态 + 调度你自己配置的命令 |
 | [experiments/verify_aggregation.md](experiments/verify_aggregation.md) | 聚合是否生效的验证方法与脱敏样例输出 |
+| [recipes/single_account_dual_bucket/](recipes/single_account_dual_bucket/) | **配方：单账号双桶**（宽带直连本体 + 同账号第二桶）——只用自己一个账号即可照做的最小配方 |
 
 ## 核心结论速览
 
@@ -32,6 +34,26 @@
 2. 路由器侧：按 `templates/multipath_setup.sh` 配置多会话 + multipath 出口。
 3. 出口侧：按 `templates/host_aggregate.yaml` 配置聚合代理（TUN 模式接管整机流量）。
 4. 验证：按 `experiments/verify_aggregation.md` 的方法测速，观察各会话实时速率是否近似叠加、总速率是否逼近 N 倍单会话上限。
+
+> 只想先试最简、只用自己一个账号的"双桶"形态？直接看 **[recipes/single_account_dual_bucket/](recipes/single_account_dual_bucket/)** 配方（宽带直连本体 + 同账号第二桶），有完整可照做的搭建步骤与模板。
+
+## 把多桶管起来：多桶聚合控制台
+
+搭好之后，日常要看状态、要续连、要测速，逐个 SSH 太累。**[tools/bucket_console/](tools/bucket_console/)** 是一个托盘 + 全操控界面的桌面控制台：
+
+- **一眼看桶状态**：总览卡片（在线/劫持/白名单/真机/聚合腿组/数据新鲜度）+ 每桶状态表 + 健康走势图；
+- **点按钮做操作**：每桶 204 探测 / 真机判定 / 续连 / 单桶测速，聚合出口重启与代理开关，计划任务启停，一键测速；
+- **只读 + 调度**：它不实现任何认证逻辑，所有动作都执行**你自己配置的命令**；环境相关的一切（桶、出口、脚本、账号）都在 `config.private.json` 里；
+- **生命周期总开关**：UI 起则拉起服务链，UI 退则全链停，配套任务以心跳文件为门控。
+
+```bash
+cd tools/bucket_console
+cp config.example.json config.private.json   # 填占位符（该命名已被 .gitignore 忽略）
+python bucket_console.py --check             # 先自检
+python bucket_console.py                     # 再开界面
+```
+
+详见 [tools/bucket_console/README.md](tools/bucket_console/README.md)（含与内部测试版一致的 UI 对照表、数据文件约定、凭据库与安全边界）。
 
 ## 免责声明
 
