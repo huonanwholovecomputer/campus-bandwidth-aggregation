@@ -9,3 +9,8 @@
 *.json text eol=lf
 *.txt  text eol=lf
 *.ps1  text eol=lf
+
+# 截图资产：二进制，禁止任何行尾转换（否则 Windows 侧检出后图片损坏）
+*.jpg  binary
+*.jpeg binary
+*.png  binary
