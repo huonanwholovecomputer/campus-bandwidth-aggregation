@@ -13,8 +13,11 @@
   P10 分流熔断（连续超阈值隔离 / 连续达标恢复 / keep_min 保护 / 状态落盘）
   P11 桶停用-启用（enabled=false 不探测不动作）
 
-用法: python checks/verify_ports.py
+用法: python checks/verify_ports.py [计划任务名]
+      （可选参数用于 P1：指定一个本机已注册的计划任务当夹具；不传则自动枚举取第一个，
+        取不到就跳过该项。测试夹具不硬编码任何环境私有任务名。）
 """
+import csv
 import os
 import subprocess
 import sys
@@ -40,8 +43,25 @@ def check(name, cond, detail=""):
 
 try:
     print("== P1 task_state ==")
-    st = bc.task_state("WeNetState")
-    check("已注册任务返回规范英文状态", st in ("Ready", "Running", "Disabled"), "-> %r" % st)
+    # 任务名属环境私有（见 config.private.json 的 tasks[]），这里**不硬编码任何具体任务名**：
+    # 可用 argv[1] 显式指定一个本机已注册任务，否则枚举任务库取第一个当夹具；
+    # 两者都拿不到（无任务 / 平台不支持 / 枚举超时）则跳过该项，不算失败。
+    real = sys.argv[1] if len(sys.argv) > 1 else ""
+    if not real:
+        try:
+            probe = subprocess.run(["schtasks.exe", "/Query", "/FO", "CSV", "/NH"],
+                                   capture_output=True, timeout=20)
+            for row in csv.reader(bc._decode_console(probe.stdout or b"").splitlines()):
+                if len(row) >= 3 and row[0].strip().strip("\\"):
+                    real = row[0].strip().strip("\\").split("\\")[-1]
+                    break
+        except Exception:  # noqa: BLE001
+            real = ""
+    if real:
+        st = bc.task_state(real)
+        check("已注册任务返回规范英文状态", st in ("Ready", "Running", "Disabled"), "-> %r" % st)
+    else:
+        print("   [SKIP] 未取得已注册任务名（可传参指定：verify_ports.py <任务名>），跳过该项")
     check("不存在任务返回「不存在」", bc.task_state("NoSuchTaskXYZ") == "不存在")
     check("本地化映射表存在", "准备就绪" in bc._TASK_STATE_MAP)
     check("_decode_console 可解 GBK", bc._decode_console("就绪".encode("cp936")) == "就绪")

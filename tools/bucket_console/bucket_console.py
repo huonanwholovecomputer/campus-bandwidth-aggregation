@@ -277,7 +277,8 @@ _TASK_STATE_MAP = {
 def task_state(name):
     """schtasks 查询（Windows）；其它平台返回「不适用」。
 
-    实测格式（本机）：`"\\WeNetState","2026/9/9 20:25:00","Ready"` —— **3 列**。
+    实测格式（本机）：`"\\ExampleTask","2026/9/9 20:25:00","Ready"` —— **3 列**
+    （任务名是环境私有值，具体叫什么由你在 config.private.json 的 tasks[] 里配）。
     旧实现按 4 列解析（row[1] 当任务名、row[3] 当状态），`/TN` 查询只有 3 列，
     于是 len(row) >= 4 恒为假 → 所有任务都显示「未知」（2026-09-09 由内部测试版回灌）。
     """
