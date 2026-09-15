@@ -227,8 +227,12 @@ def probe_bucket(cfg, bucket, tries=None, timeout=None, target=None):
         state = "portal"
     else:
         state = "loss"
-    # 丢包率：HTTP 层 = 没拿到 204 的比例；ICMP 层 = ping 汇总行里的百分比
-    http_loss = int(round(100.0 * (tries - ok) / tries)) if tries else None
+    # 丢包率：HTTP 层 = 没拿到 204 的比例；ICMP 层 = ping 汇总行里的百分比。
+    # 门户劫持（portal）不算丢包：流量是被重定向了，不是丢在路上。若照 100% 上报，
+    # 熔断（默认 50% × 连续 2 轮）会把所有好腿当坏腿逐个摘掉，而"门户要求重新认证"
+    # 恰恰是 docs/04 F5 里的常规事件。故 portal 态不报丢包率。
+    http_loss = (int(round(100.0 * (tries - ok) / tries))
+                 if tries and state in ("ok", "loss") else None)
     icmp_loss, icmp_note = (None, "")
     if state != "n/a":
         icmp_loss, icmp_note = icmp_loss_pct(cfg, bucket)
@@ -274,10 +278,11 @@ def probe_all(cfg, only=None):
         results[b["id"]] = r
         if r["state"] != "n/a":
             updates[b["state_key"]] = r["state"]
-            if r.get("http_loss") is not None:
-                updates["loss_" + b["state_key"]] = r["http_loss"]
-            if r.get("icmp_loss") is not None:
-                updates["icmp_" + b["state_key"]] = r["icmp_loss"]
+            # 两个丢包率都无条件写入（值可能为 None）：判定"这一轮测不出丢包率"时
+            # 必须显式清掉上一轮的旧值，否则界面会把过期数字一直挂在这个桶上
+            # （例如门户劫持后仍显示着上一轮的 100%）。
+            updates["loss_" + b["state_key"]] = r.get("http_loss")
+            updates["icmp_" + b["state_key"]] = r.get("icmp_loss")
     return results, updates
 
 

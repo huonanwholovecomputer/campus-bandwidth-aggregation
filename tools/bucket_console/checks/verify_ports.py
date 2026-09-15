@@ -12,6 +12,7 @@
   P9 配置编辑器（热更新 / 非法值不写盘 / .bak 备份）
   P10 分流熔断（连续超阈值隔离 / 连续达标恢复 / keep_min 保护 / 状态落盘）
   P11 桶停用-启用（enabled=false 不探测不动作）
+  P12 门户劫持不计入丢包（portal 态不报丢包率 → 熔断不会把好腿当坏腿摘掉）
 
 用法: python checks/verify_ports.py [计划任务名]
       （可选参数用于 P1：指定一个本机已注册的计划任务当夹具；不传则自动枚举取第一个，
@@ -303,6 +304,67 @@ try:
     check("停用桶不探测（state=n/a 且不写状态）",
           _r0["state"] == "n/a" and not _upd, (_r0["state"], _upd))
     _sh.rmtree(_d11, ignore_errors=True)
+
+    print("\n== P12 门户劫持不计入丢包（避免熔断误摘好腿） ==")
+    # 门户劫持时全部请求都拿不到 204，但那是被重定向、不是丢包。若照 100% 上报丢包率，
+    # 熔断（默认 50% × 连续 2 轮）会把所有好腿当坏腿逐个摘掉 —— 而"门户要求重新认证"
+    # 恰恰是 docs/04 F5 里的常规事件。这里锁住「portal 态不报丢包率」这一条。
+    import probe_buckets as pb12
+    _d12 = tempfile.mkdtemp(prefix="bc_p12_")
+    with open(os.path.join(os.path.dirname(HERE), "config.example.json"),
+              encoding="utf-8-sig") as f:
+        _raw12 = _json2.load(f)
+    _raw12["app"]["data_dir"] = _d12
+    _raw12["probe"]["target"] = "http://probe.test/204"
+    _raw12["buckets"][0]["probe"]["mode"] = "local"
+    _p12 = os.path.join(_d12, "cfg.json")
+    with open(_p12, "w", encoding="utf-8") as f:
+        _json2.dump(_raw12, f, ensure_ascii=False)
+    _c12 = cc.load_config(_p12)
+    _b12 = _c12.buckets[0]
+    _brs12 = {"threshold_pct": 50, "trip_after": 2, "recover_below_pct": 10,
+              "recover_after": 3, "keep_min": 1}
+
+    _orig_run, _orig_icmp = pb12.run, pb12.icmp_loss_pct
+    pb12.icmp_loss_pct = lambda *a, **k: (None, "")     # 回归里不真去 ping
+
+    def _mk12(code, body):
+        def _fake(args, **_kw):
+            return (0, code) if "-w" in args else (0, body)
+        return _fake
+
+    try:
+        pb12.run = _mk12("200", "WISPAccessGatewayParam NextURL")
+        _rp = pb12.probe_bucket(_c12, _b12, tries=3)
+        check("门户劫持 -> state=portal 且不报丢包率",
+              _rp["state"] == "portal" and _rp["http_loss"] is None,
+              (_rp["state"], _rp["http_loss"]))
+
+        bc._BR["tripped"], bc._BR["fail"], bc._BR["ok"] = set(), {}, {}
+        _bs12 = [{"id": "T"}, {"id": "U"}]
+        _los12 = {"T": _rp["http_loss"], "U": 0}
+        _r12a = bc.breaker_round(_brs12, _bs12, _los12)
+        _r12b = bc.breaker_round(_brs12, _bs12, _los12)
+        check("熔断不会因门户劫持累计不合格轮数 / 摘腿",
+              _r12a == [] and _r12b == [] and bc._BR["tripped"] == set(),
+              (_r12a, _r12b, bc._BR["tripped"]))
+
+        pb12.run = _mk12("000", "")
+        _rl = pb12.probe_bucket(_c12, _b12, tries=3)
+        check("真丢包仍照常上报 100%（熔断仍能摘腿）",
+              _rl["state"] == "loss" and _rl["http_loss"] == 100,
+              (_rl["state"], _rl["http_loss"]))
+
+        # 状态更新必须显式写 null（而不是"省略不写"）：write_state 是合并写，
+        # 省略会让上一轮的旧丢包率永远留在状态文件里，界面一直挂着过期数字。
+        pb12.run = _mk12("200", "WISPAccessGatewayParam NextURL")
+        _res12, _upd12 = pb12.probe_all(_c12, only=[_b12["id"]])
+        _k12 = "loss_" + _b12["state_key"]
+        check("判定测不出丢包率时显式写 null（覆盖旧值）",
+              _k12 in _upd12 and _upd12[_k12] is None, _upd12)
+    finally:
+        pb12.run, pb12.icmp_loss_pct = _orig_run, _orig_icmp
+        _sh.rmtree(_d12, ignore_errors=True)
 finally:
     try:
         root.destroy()
@@ -314,4 +376,4 @@ if fails:
     for f in fails:
         print("  [FAIL] %s" % f)
     raise SystemExit(1)
-print("  [OK] P1-P11 回灌修复 / 通用化能力全部通过")
+print("  [OK] P1-P12 回灌修复 / 通用化能力全部通过")

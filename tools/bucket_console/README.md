@@ -471,13 +471,13 @@ python credstore.py remove <账号>
 ```bash
 python bucket_console.py --config config.private.json --check   # 配置自检（列出未配置项/结构性问题）
 python bucket_console.py --selftest                            # 界面构建冒烟
-python checks/verify_ports.py                                  # P1–P11：回灌修复 + 熔断 + 桶停用
+python checks/verify_ports.py                                  # P1–P12：回灌修复 + 熔断 + 桶停用
 python checks/verify_leg_ctl.py                                # 摘腿/放腿全行为（含本地假控制面）
 ```
 
 | 脚本 | 覆盖 |
 |---|---|
-| `checks/verify_ports.py` | `task_state` 解析、真机闸新鲜度、表格选中保持、按钮忙碌态、模式文件原子写、占位符安全替换、配置结构性自检、配置编辑器（保存/备份/校验/热更新）、**分流熔断**（抖动不误摘 / `keep_min` / 恢复需连续达标 / 状态落盘 / 动作失败不假装已隔离）、**桶停用**（不探测不写状态） |
+| `checks/verify_ports.py` | `task_state` 解析、真机闸新鲜度、表格选中保持、按钮忙碌态、模式文件原子写、占位符安全替换、配置结构性自检、配置编辑器（保存/备份/校验/热更新）、**分流熔断**（抖动不误摘 / `keep_min` / 恢复需连续达标 / 状态落盘 / 动作失败不假装已隔离）、**桶停用**（不探测不写状态）、**门户劫持不计入丢包**（portal 态不报丢包率 → 熔断不会误摘好腿） |
 | `checks/verify_leg_ctl.py` | 文本级解析与渲染（引号/注释/顺序）、`off`/`on`/幂等、`keep_min` 与未知腿拒绝、`--dry-run` 不落盘、母本播种告警、漂移 `sync`、`sync --from-breaker`、热更新失败与跳过语义、本地假控制面校验 PUT 的 URL 与请求体 |
 
 > 两个脚本都自带临时目录与假服务，**不碰你的真实配置与网络**。
