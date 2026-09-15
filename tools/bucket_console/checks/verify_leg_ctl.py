@@ -75,6 +75,24 @@ proxies:
 """
 
 
+MULTI_YAML = """proxies:
+  - name: A-direct
+    type: socks5
+    server: leg-a.test
+    port: 1080
+  - name: B-socks
+    type: socks5
+    server: leg-b.test
+    port: 1081
+proxy-groups:
+  - name: mygroup
+    type: select
+    proxies: [A-direct, B-socks]
+rules:
+  - MATCH,mygroup
+"""
+
+
 def build_env(tmp, keep_min=1, api=API):
     """造一份最小配置 + 母本 + 生效文件，返回 (cfg 路径, provider 路径, full 路径)。"""
     with open(os.path.join(ROOT, "config.example.json"), encoding="utf-8-sig") as f:
@@ -127,6 +145,32 @@ try:
         check("流式写法明确拒绝", False)
     except ValueError as e:
         check("流式写法明确拒绝", "流式" in str(e), str(e))
+
+    print("\n== 多段文件：只动 proxies 段 ==")
+    # 旧实现把「上一个 - name: 到下一个 - name:」之间全归进上一条腿，后续段的段头会被
+    # 吸进最后一条腿 —— 那条腿一被剔除，proxy-groups:/rules: 就跟着消失，组定义被当成
+    # 节点写进 proxies，rules 变成悬空引用。这里把「其余段原样保留」钉住。
+    check("解析只取 proxies 段（不把组定义当腿）",
+          [b["name"] for b in lc.parse_legs(MULTI_YAML)] == ["A-direct", "B-socks"],
+          [b["name"] for b in lc.parse_legs(MULTI_YAML)])
+    r = lc.render_legs(MULTI_YAML, ["B-socks"])
+    check("剔除末腿后 proxy-groups 段头仍在", "proxy-groups:" in r, repr(r))
+    check("剔除末腿后 rules 段头仍在", "rules:" in r, repr(r))
+    check("组定义没被写进 proxies", r.index("proxy-groups:") > r.index("A-direct"), repr(r))
+    check("其余段落逐字保留",
+          "  - name: mygroup\n    type: select\n    proxies: [A-direct, B-socks]\n"
+          in r and "  - MATCH,mygroup\n" in r, repr(r[r.index("proxy-groups:"):]))
+    check("顶层段仍是 3 个、腿仍是 1 条",
+          lc._toplevel_keys(r) == ["proxies", "proxy-groups", "rules"]
+          and [b["name"] for b in lc.parse_legs(r)] == ["A-direct"], lc._toplevel_keys(r))
+    check("原样往返不动结构",
+          [b["name"] for b in lc.parse_legs(lc.render_legs(MULTI_YAML, []))] ==
+          ["A-direct", "B-socks"] and lc.render_legs(MULTI_YAML, []).count("proxy-groups:") == 1)
+    try:
+        lc.parse_legs("proxy-groups:\n  - name: g\n    proxies: [x]\n")
+        check("没有 proxies 段却另有段 → 明确拒绝", False)
+    except ValueError as e:
+        check("没有 proxies 段却另有段 → 明确拒绝", "proxies" in str(e), str(e))
 
     tmp = tempfile.mkdtemp(prefix="bc_legs_")
     cfgp, pf, full = build_env(tmp)
@@ -187,6 +231,33 @@ try:
           json.load(open(os.path.join(tmp2, "data", "legs_excluded.json"),
                          encoding="utf-8"))["excluded"] == ["A-direct"])
     shutil.rmtree(tmp2, ignore_errors=True)
+
+    print("\n== 母本里已消失的腿不再卡死 ==")
+    # 改了母本（或熔断同步进来一条已删掉的腿）之后，剔除集合里会留下母本中不存在的名字。
+    # 旧实现一律返回 RC_LEGS，连「摘另一条好腿」都做不了，只能手工 on <已消失的腿> 才解开。
+    tmp5 = tempfile.mkdtemp(prefix="bc_legs5_")
+    cfgp5, pf5, full5 = build_env(tmp5)
+    run(cfgp5, "off", "--leg", "C-eth3", "--no-reload")
+    with open(full5, "w", encoding="utf-8", newline="\n") as f:
+        f.write(FULL_YAML.replace("C-eth3", "C-legacy"))     # 母本里 C-eth3 已不存在
+    rc = run(cfgp5, "off", "--leg", "B-socks", "--no-reload")
+    check("剔除集合里有已消失的腿时，仍能摘另一条", rc == 0, rc)
+    check("已消失的腿不会写进生效文件", "C-eth3" not in read(pf5), read(pf5))
+    check("被摘的腿确实生效", "B-socks" not in read(pf5) and "C-legacy" in read(pf5))
+    ex_now = json.load(open(os.path.join(tmp5, "data", "legs_excluded.json"),
+                            encoding="utf-8"))["excluded"]
+    check("普通命令不动剔除集合原文（留给 sync 清理）",
+          ex_now == ["B-socks", "C-eth3"], ex_now)
+    rc = run(cfgp5, "sync")
+    check("sync 清理已消失的腿并退出码 0", rc == 0, rc)
+    check("sync 后剔除集合只剩真实存在的腿",
+          json.load(open(os.path.join(tmp5, "data", "legs_excluded.json"),
+                         encoding="utf-8"))["excluded"] == ["B-socks"])
+    before5 = read(pf5)
+    rc = run(cfgp5, "off", "--leg", "GoneLeg")
+    check("本次显式指定不存在的腿仍然报错（退出码 3）", rc == 3, rc)
+    check("报错后生效文件未被改动", read(pf5) == before5)
+    shutil.rmtree(tmp5, ignore_errors=True)
 
     print("\n== 播种 / 漂移 / 熔断同步 ==")
     os.remove(full)

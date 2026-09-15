@@ -49,7 +49,7 @@
 - **配置不用手改 JSON**：「配置」按钮打开 schema 驱动的编辑器，保存前校验、自动备份、就地热更新；
 - **只读 + 调度**：它不实现任何认证逻辑，所有动作都执行**你自己配置的命令**；环境相关的一切（桶、出口、脚本、账号）都在 `config.private.json` 里；
 - **生命周期总开关**：UI 起则拉起服务链，UI 退则全链停，配套任务以心跳文件为门控；
-- **自带回归**：`checks/verify_ports.py`（P1–P12 回灌修复）与 `checks/verify_leg_ctl.py`（摘腿/放腿全行为）可重复运行。
+- **自带回归**：`checks/verify_ports.py`（P1–P16 回灌修复）与 `checks/verify_leg_ctl.py`（摘腿/放腿全行为）可重复运行。
 
 ```bash
 cd tools/bucket_console

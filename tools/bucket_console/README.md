@@ -471,7 +471,7 @@ python credstore.py remove <账号>
 ```bash
 python bucket_console.py --config config.private.json --check   # 配置自检（列出未配置项/结构性问题）
 python bucket_console.py --selftest                            # 界面构建冒烟
-python checks/verify_ports.py                                  # P1–P12：回灌修复 + 熔断 + 桶停用
+python checks/verify_ports.py                                  # P1–P16：回灌修复 + 熔断 + 桶停用
 python checks/verify_leg_ctl.py                                # 摘腿/放腿全行为（含本地假控制面）
 ```
 

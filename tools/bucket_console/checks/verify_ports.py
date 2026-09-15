@@ -13,6 +13,10 @@
   P10 分流熔断（连续超阈值隔离 / 连续达标恢复 / keep_min 保护 / 状态落盘）
   P11 桶停用-启用（enabled=false 不探测不动作）
   P12 门户劫持不计入丢包（portal 态不报丢包率 → 熔断不会把好腿当坏腿摘掉）
+  P13 配置类型写错归一到 ConfigError（不抛裸 AttributeError / ValueError）
+  P14 占位符判定（裸 `<name>` 与复合模板算未配置；shell 重定向不算）
+  P15 写盘锁（含残留死锁回收）/ 备份名同秒不撞车 / tail_log 只读尾部
+  P16 字符串命令的替换值转义（argv 为字符串时走 shell=True）
 
 用法: python checks/verify_ports.py [计划任务名]
       （可选参数用于 P1：指定一个本机已注册的计划任务当夹具；不传则自动枚举取第一个，
@@ -32,8 +36,14 @@ import bucket_console as bc  # noqa: E402
 import console_config as cc  # noqa: E402
 
 fails = []
-root = tk.Tk()
-root.withdraw()
+try:
+    root = tk.Tk()
+    root.withdraw()
+except Exception as _tkerr:  # noqa: BLE001
+    # 无显示环境（CI / 纯终端）下 tk.Tk() 会直接抛，原来在 import 时就构造，
+    # 整个脚本连非界面用例都跑不了。这里降级为跳过界面用例。
+    root = None
+    print("   [SKIP] 无法创建 Tk 根窗口（%s），跳过依赖界面的用例" % _tkerr)
 
 
 def check(name, cond, detail=""):
@@ -80,57 +90,84 @@ try:
         check("argv_for 不再抛 KeyError", False, repr(e))
 
     print("\n== P3 表格选中保持 ==")
-    tr = ttk.Treeview(root, columns=("a",), show="headings")
-    for i in range(5):
-        tr.insert("", "end", iid="r%d" % i, values=(i,))
-    tr.selection_set("r2")
-    st0 = bc.App._tv_state(tr)
-    for row in tr.get_children():
-        tr.delete(row)
-    for i in range(5):
-        tr.insert("", "end", iid="r%d" % i, values=(i,))
-    bc.App._tv_restore(tr, st0)
-    check("重建后选中保持", tuple(tr.selection()) == ("r2",), tuple(tr.selection()))
+    if root is None:
+        print("   [SKIP] 需要 Tk")
+    else:
+        tr = ttk.Treeview(root, columns=("a",), show="headings")
+        for i in range(5):
+            tr.insert("", "end", iid="r%d" % i, values=(i,))
+        tr.selection_set("r2")
+        st0 = bc.App._tv_state(tr)
+        for row in tr.get_children():
+            tr.delete(row)
+        for i in range(5):
+            tr.insert("", "end", iid="r%d" % i, values=(i,))
+        bc.App._tv_restore(tr, st0)
+        check("重建后选中保持", tuple(tr.selection()) == ("r2",), tuple(tr.selection()))
 
     print("\n== P5 按钮忙碌态 ==")
-    b = ttk.Button(root, text="立即运行")
-    bc.App._btn_busy(None, b, True, "运行中…")
-    t1, s1 = b.cget("text"), tuple(b.state())
-    bc.App._btn_busy(None, b, True, "运行中…")
-    bc.App._btn_busy(None, b, False)
-    t2, s2 = b.cget("text"), tuple(b.state())
-    check("置忙：禁用 + 改文字", t1 == "运行中…" and "disabled" in s1, "%r %s" % (t1, s1))
-    check("复位：恢复原文字", t2 == "立即运行" and "disabled" not in s2, "%r %s" % (t2, s2))
+    if root is None:
+        print("   [SKIP] 需要 Tk")
+    else:
+        b = ttk.Button(root, text="立即运行")
+        bc.App._btn_busy(None, b, True, "运行中…")
+        t1, s1 = b.cget("text"), tuple(b.state())
+        bc.App._btn_busy(None, b, True, "运行中…")
+        bc.App._btn_busy(None, b, False)
+        t2, s2 = b.cget("text"), tuple(b.state())
+        check("置忙：禁用 + 改文字", t1 == "运行中…" and "disabled" in s1, "%r %s" % (t1, s1))
+        check("复位：恢复原文字", t2 == "立即运行" and "disabled" not in s2, "%r %s" % (t2, s2))
 
     print("\n== P6 模式文件原子写 ==")
     tmp = tempfile.mkdtemp(prefix="bc_mode_")
     mf = os.path.join(tmp, "aggregator_mode.txt")
     with open(mf, "w", encoding="ascii") as f:
         f.write("rule\n")
-    # 直接测写路径：伪造一个最小 cfg 对象
-    class _Agg(dict):
-        pass
+    cc.write_atomic(mf, "direct\n", encoding="ascii")
+    check("write_atomic：内容正确且无残留 .tmp",
+          open(mf, encoding="ascii").read() == "direct\n"
+          and not os.path.exists(mf + ".tmp"), repr(open(mf, encoding="ascii").read()))
 
-    class _Cfg:
-        aggregation = {"mode_file": mf, "api": ""}
+    # 真跑一遍 set_proxy_mode（注入假控制面），确认生产路径确实走 write_atomic。
+    # 原用例自己重抄了一遍 open→fsync→os.replace，从头到尾没调用过 set_proxy_mode，
+    # 生产代码退回「截断再写」它照样绿。
+    class _ModeCfg:
+        aggregation = {"mode_file": mf, "api": "http://fake.invalid",
+                       "restart_action": "restart_aggregator"}
+
         def has_action(self, _n):
             return True
-    # set_proxy_mode 会先查 API（不可达即返回），这里只验证原子写片段
-    _tmp = mf + ".tmp"
-    with open(_tmp, "w", encoding="ascii") as f:
-        f.write("direct\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(_tmp, mf)
-    content = open(mf, encoding="ascii").read()
-    check("原子替换后内容正确且无残留 .tmp",
-          content == "direct\n" and not os.path.exists(_tmp), repr(content))
+
+    with open(mf, "w", encoding="ascii") as f:
+        f.write("rule\n")
+    _seen = {}
+    _orig = (bc.agg_api_json, bc.exec_action, bc.time.sleep, cc.write_atomic)
+
+    def _spy_write(path, text, **kw):
+        _seen["atomic"] = True
+        return _orig[3](path, text, **kw)
+
+    bc.agg_api_json = lambda _c, _p: {"mode": open(mf, encoding="ascii").read().strip()}
+    bc.exec_action = lambda *_a, **_k: (0, "")
+    bc.time.sleep = lambda _s: None
+    cc.write_atomic = _spy_write
+    try:
+        _ok, _msg = bc.set_proxy_mode(_ModeCfg(), "direct")
+        check("set_proxy_mode 经 write_atomic 落盘并确认切换",
+              _ok and _seen.get("atomic")
+              and open(mf, encoding="ascii").read() == "direct\n", (_ok, _msg))
+    finally:
+        bc.agg_api_json, bc.exec_action, bc.time.sleep, cc.write_atomic = _orig
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n== P2 真机闸新鲜度 ==")
-    src = open(os.path.join(os.path.dirname(HERE), "bucket_console.py"), encoding="utf-8").read()
-    check("_real_gate 含新鲜度校验", "max_age_min" in src and "已过期" in src)
+    # 行为断言。原实现是源码子串检查（"max_age_min" in src），把逻辑取反也能通过。
+    check("读不到时间戳 → 拦截（fail-closed）",
+          bc.portal_fresh_enough(None, 3.0) == (False, "读取失败"))
+    check("超过阈值 → 拦截", bc.portal_fresh_enough(5.0, 3.0)[0] is False)
+    check("正好等于阈值 → 放行（不误伤）", bc.portal_fresh_enough(3.0, 3.0)[0] is True)
+    check("阈值内 → 放行", bc.portal_fresh_enough(1.0, 3.0) == (True, ""))
 
     print("\n== P8 配置结构性自检 ==")
     probs = cfg.problems()
@@ -365,6 +402,120 @@ try:
     finally:
         pb12.run, pb12.icmp_loss_pct = _orig_run, _orig_icmp
         _sh.rmtree(_d12, ignore_errors=True)
+
+    print("\n== P13 配置类型写错归一到 ConfigError ==")
+    # 裸 AttributeError / ValueError 会让 CLI 与 GUI 直接 traceback 崩掉（入口只捕
+    # ConfigError）。这里把典型写错逐条钉住。
+    _ex = os.path.join(os.path.dirname(HERE), "config.example.json")
+    _base = cc.load_raw(_ex)
+
+    def _cfg_with(mut):
+        raw = _copy.deepcopy(_base)
+        mut(raw)
+        return cc.Cfg(raw, _ex)
+
+    def _sub(d, k, v):
+        d[k] = v
+
+    _cases = [
+        ("app 写成字符串", lambda r: _sub(r, "app", "x")),
+        ("probe 写成字符串", lambda r: _sub(r, "probe", "socks")),
+        ("aggregation 写成数组", lambda r: _sub(r, "aggregation", [])),
+        ("ui 写成字符串", lambda r: _sub(r, "ui", "wide")),
+        ("buckets 写成字符串", lambda r: _sub(r, "buckets", "A")),
+        ("ui.interval_ms 写成 abc", lambda r: _sub(r["ui"], "interval_ms", "abc")),
+        ("probe.icmp_count 写成 abc", lambda r: _sub(r["probe"], "icmp_count", "abc")),
+        ("breaker.threshold_pct 写成 abc",
+         lambda r: _sub(r["aggregation"].setdefault("breaker", {}), "threshold_pct", "abc")),
+        ("renew.ssh.port 写成 abc",
+         lambda r: _sub(r["buckets"][0].setdefault("renew", {}), "ssh", {"port": "abc"})),
+        ("桶的 probe 写成字符串", lambda r: _sub(r["buckets"][0], "probe", "local")),
+        ("桶的 kind 写成数字", lambda r: _sub(r["buckets"][0], "kind", 3)),
+        ("aggregation.legs 写成字符串", lambda r: _sub(r["aggregation"], "legs", "legs.yaml")),
+    ]
+    for _nm, _mut in _cases:
+        try:
+            _cfg_with(_mut)
+            check(_nm, False, "没抛异常（类型错误被静默吞掉）")
+        except cc.ConfigError as _e:
+            check(_nm, True, str(_e)[:60])
+        except Exception as _e:  # noqa: BLE001
+            check(_nm, False, "抛了 %s：%s" % (type(_e).__name__, _e))
+
+    print("\n== P14 占位符判定 ==")
+    check("裸占位符 = 未配置", cc.is_unset("<探活目标URL>"))
+    check("复合模板 = 未配置（api / socks / provider_name 那种）",
+          cc.is_unset("http://<控制API地址>")
+          and cc.is_unset("socks5h://<管理IP>:<SOCKS端口-A>")
+          and cc.is_unset("<proxy-provider 名>"))
+    check("shell 重定向不再被误判成未配置",
+          not cc.is_unset("cmd < in > out") and not cc.is_unset("cat<in>out"))
+    check("普通值当然不是未配置", not cc.is_unset("curl -s http://real/"))
+    check("示例配置仍无结构性问题", cc.load_config(_ex).problems() == [],
+          cc.load_config(_ex).problems())
+
+    print("\n== P15 写盘锁 / 备份名 / 尾部读日志 ==")
+    import time as _t
+    _d15 = tempfile.mkdtemp(prefix="bc_p15_")
+    _f15 = os.path.join(_d15, "x.txt")
+    with cc.file_lock(_f15, timeout=1.0):
+        check("持锁期间 .lock 存在", os.path.exists(_f15 + ".lock"))
+    check("释放后 .lock 已清理", not os.path.exists(_f15 + ".lock"))
+
+    # 残留死锁（写进一个不可能存在的 PID）必须能被回收，否则一次 Ctrl+C 就永久只读
+    with open(_f15 + ".lock", "w", encoding="ascii") as f:
+        f.write("999999999 %f" % _t.time())
+    try:
+        with cc.file_lock(_f15, timeout=3.0):
+            check("残留死锁被回收，仍能拿到锁", True)
+    except Exception as _e:  # noqa: BLE001
+        check("残留死锁被回收，仍能拿到锁", False, repr(_e))
+
+    _p15 = os.path.join(_d15, "cfg.json")
+    with open(_p15, "w", encoding="utf-8") as f:
+        f.write("{}")
+    _b1 = cc.backup_name(_p15)
+    with open(_b1, "w", encoding="utf-8") as f:
+        f.write("")
+    _b2 = cc.backup_name(_p15)
+    check("同一秒内两次备份不互相覆盖", _b1 != _b2, (_b1, _b2))
+
+    _log15 = os.path.join(_d15, "ev.log")
+    with open(_log15, "w", encoding="utf-8") as f:
+        for _i in range(500):
+            f.write("line-%d\n" % _i)
+    _txt, _n = bc.tail_log(_log15, n=150)
+    check("tail_log 行数正确", _n == 500, _n)
+    check("tail_log 只取尾部 150 行",
+          len(_txt.splitlines()) == 150 and _txt.splitlines()[-1] == "line-499",
+          _txt.splitlines()[:1])
+    _sh.rmtree(_d15, ignore_errors=True)
+
+    print("\n== P16 字符串命令的替换值转义 ==")
+    # 字符串 argv 走 shell=True，account / iface / target 里有一部分来自门户产物。
+    # 不转义时一个空格就换参数、一个 & 或 ; 就能接着跑第二条命令。
+    _raw16 = _copy.deepcopy(_base)
+    _raw16["actions"]["q_str"] = {"argv": "run {account}", "timeout": 5}
+    _raw16["actions"]["q_list"] = {"argv": ["run", "{account}"], "timeout": 5}
+    _c16 = cc.Cfg(_raw16, _ex)
+    _b16 = dict(_c16.buckets[0])
+    _b16["account"] = "a b"
+    check("字符串 argv：含空格的值被引起来",
+          _c16.argv_for("q_str", _b16) != "run a b",
+          _c16.argv_for("q_str", _b16))
+    check("列表 argv：不过 shell，值原样保留",
+          _c16.argv_for("q_list", _b16) == ["run", "a b"],
+          _c16.argv_for("q_list", _b16))
+    if os.name == "nt":
+        check("Windows：& 与 | 被双引号挡住",
+              cc.quote_shell("a&b") == '"a&b"' and cc.quote_shell("a|b") == '"a|b"',
+              cc.quote_shell("a&b"))
+        check("Windows：内嵌双引号被转义", cc.quote_shell('a"b') == '"a\\"b"',
+              cc.quote_shell('a"b'))
+        check("Windows：普通值不加引号", cc.quote_shell("eth0") == "eth0")
+    else:
+        check("POSIX：分号被单引号挡住", cc.quote_shell("a;b") == "'a;b'", cc.quote_shell("a;b"))
+        check("POSIX：普通值不加引号", cc.quote_shell("eth0") == "eth0")
 finally:
     try:
         root.destroy()
@@ -376,4 +527,4 @@ if fails:
     for f in fails:
         print("  [FAIL] %s" % f)
     raise SystemExit(1)
-print("  [OK] P1-P12 回灌修复 / 通用化能力全部通过")
+print("  [OK] P1-P16 回灌修复 / 通用化能力全部通过")
