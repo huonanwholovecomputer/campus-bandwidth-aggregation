@@ -24,7 +24,9 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
+import time
 
 
 def safe_console():
@@ -41,7 +43,42 @@ def safe_console():
             pass
 
 
-_PLACEHOLDER_RE = re.compile(r"<[^<>]{1,60}>")
+def decode_console(b: bytes) -> str:
+    """子进程输出解码：UTF-8 → CP936 → Latin-1 依次尝试。
+
+    中文 Windows 上 schtasks 的状态文本、ping 的汇总行都随控制台代码页在
+    中英文之间变化，固定 utf-8 解码会得到 U+FFFD 乱码（数字仍可解析，
+    但显示出来是乱码）。全仓共用这一份，别再各写各的。
+    """
+    if isinstance(b, str):
+        return b
+    for enc in ("utf-8", "cp936", "latin-1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", "replace")
+
+
+# 占位符 = `<内容>`，内容非空、不含尖括号、不以空白开头/结尾，且两侧不粘着词字符。
+# 这三条都是为了和「命令里本来就有尖括号」区分开：
+#   · 卡空白     -> `cmd < in > out` 不算占位符（旧规则会把整条命令判成「未配置」）
+#   · 卡粘连     -> `cat<in>out` 不算占位符（重定向/比较符）
+#   · 仍需两侧是边界/标点 -> `http://<地址>`、`socks5h://<IP>:<端口>` 仍算模板
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])<[^\s<>](?:[^<>]*[^\s<>])?>(?![A-Za-z0-9_])")
+
+
+def _is_template(s: str) -> bool:
+    """整串是否「由占位符拼成的模板」，如 `<URL>`、`http://<IP>:<端口>`。
+
+    判据：至少有一个占位符，且把占位符挖掉后剩下的部分不含空白。
+    于是 `socks5h://<管理IP>:<SOCKS端口-A>` 算模板，而 `cmd < in > out`、`cat<in>out`
+    这类把尖括号用在别处的字符串不算。
+    """
+    if not _PLACEHOLDER_TOKEN_RE.search(s):
+        return False
+    return not re.search(r"\s", _PLACEHOLDER_TOKEN_RE.sub("", s))
 
 BUCKET_KINDS = ("self", "clone")
 PROBE_MODES = ("local", "socks", "ssh", "none")
@@ -73,10 +110,50 @@ def is_unset(v) -> bool:
         return True
     if isinstance(v, str):
         s = v.strip()
-        return s == "" or bool(_PLACEHOLDER_RE.search(s))
+        return s == "" or _is_template(s)
     if isinstance(v, (list, dict)):
         return len(v) == 0
     return False
+
+
+# --------------------------------------------------------------------------
+# 类型归一：配置写错类型时抛 ConfigError，而不是让裸 AttributeError/ValueError
+# 冒到 CLI 与界面上（那些入口只捕 ConfigError，其它异常直接 traceback 崩掉）。
+# --------------------------------------------------------------------------
+def _as_dict(v, what: str) -> dict:
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    raise ConfigError("%s 必须是对象（当前是 %s）" % (what, type(v).__name__))
+
+
+def _as_str(v, what: str, default: str = "") -> str:
+    if v is None or v == "":
+        return default
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return str(v)
+    raise ConfigError("%s 必须是字符串（当前是 %s）" % (what, type(v).__name__))
+
+
+def _str_or(v, default: str = "") -> str:
+    """不抛异常版的取字符串（配置校验器用：它只收集问题，不该因为类型错就崩）。"""
+    if v is None or v == "":
+        return default
+    return v if isinstance(v, str) else str(v)
+
+
+def _as_int(v, what: str, default: int = 0) -> int:
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        raise ConfigError("%s 必须是整数（当前是布尔值）" % what)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise ConfigError("%s 必须是整数（当前是 %r）" % (what, v))
 
 
 def expand_path(p, base=None) -> str:
@@ -133,13 +210,16 @@ def validate_bucket(raw: dict, other_ids=()) -> list[str]:
         errs.append("桶标识只允许字母数字开头、含 [A-Za-z0-9_-]，最长 32")
     elif bid in others:
         errs.append("桶标识 %s 已存在" % bid)
-    kind = (raw.get("kind") or "self").strip()
+    def _d(v):
+        return v if isinstance(v, dict) else {}
+
+    kind = _str_or(raw.get("kind"), "self").strip()
     if kind not in BUCKET_KINDS:
         errs.append("kind 必须是 %s" % "/".join(BUCKET_KINDS))
-    pmode = ((raw.get("probe") or {}).get("mode") or "local").strip()
+    pmode = _str_or(_d(raw.get("probe")).get("mode"), "local").strip()
     if pmode not in PROBE_MODES:
         errs.append("probe.mode 必须是 %s" % "/".join(PROBE_MODES))
-    rmode = ((raw.get("renew") or {}).get("mode") or "none").strip()
+    rmode = _str_or(_d(raw.get("renew")).get("mode"), "none").strip()
     if rmode not in RENEW_MODES:
         errs.append("renew.mode 必须是 %s" % "/".join(RENEW_MODES))
     mac = raw.get("mac")
@@ -148,13 +228,13 @@ def validate_bucket(raw: dict, other_ids=()) -> list[str]:
             errs.append("MAC 格式应为 XX:XX:XX:XX:XX:XX（或连字符分隔）")
         elif mac_is_multicast(mac):
             errs.append("MAC %s 是组播地址（首字节最低位为 1），一般不能作为网卡地址" % mac)
-    if kind == "clone" and not (raw.get("clone") or {}).get("portal_id"):
+    if kind == "clone" and not _d(raw.get("clone")).get("portal_id"):
         errs.append("克隆桶需要 clone.portal_id（用于关联门户判定数据）")
     if rmode == "ssh_ifup":
-        ssh = ((raw.get("renew") or {}).get("ssh") or {})
+        ssh = _d(_d(raw.get("renew")).get("ssh"))
         if not ssh.get("host"):
             errs.append("续连方式 ssh_ifup 需要 renew.ssh.host")
-        if not (raw.get("renew") or {}).get("wan"):
+        if not _d(raw.get("renew")).get("wan"):
             errs.append("续连方式 ssh_ifup 需要 renew.wan")
     return errs
 
@@ -194,49 +274,191 @@ def _set_path(d: dict, path: str, val) -> None:
     cur[ks[-1]] = val
 
 
+class _FileLock:
+    """跨进程独占锁（O_EXCL 创建，超时放弃）+ PID 回收。
+
+    写盘前先拿锁：配置回写、探活状态、腿列表渲染都是「读全文 → 改 → 写回」，
+    两个写者会互相抹掉对方的改动；共用的 `<file>.tmp` 还会让 os.replace 直接撞车。
+
+    被 Ctrl+C / kill 掉时锁文件会残留，所以记下 PID 与启动时刻：超时后若持锁进程
+    已不存在、或锁文件明显超出本次等待窗口，就当它是死锁一并清掉 —— 否则一次中断
+    会让这个文件永久写不进去，只能人工删 .lock。
+    """
+
+    def __init__(self, path: str, timeout: float = 10.0):
+        self.path = str(path) + ".lock"
+        self.timeout = timeout
+        self.fd = None
+
+    def _stale(self) -> bool:
+        try:
+            age = time.time() - os.path.getmtime(self.path)
+        except OSError:
+            return True                      # 读不到 = 已被释放，重试即可
+        if age > max(60.0, self.timeout * 6):
+            return True
+        try:
+            with open(self.path, "r", encoding="ascii", errors="replace") as f:
+                holder = f.read().split()
+            pid = int(holder[0])
+            started = float(holder[1]) if len(holder) > 1 else 0.0
+        except Exception:  # noqa: BLE001
+            return age > self.timeout       # 内容不可读：给足一个等待窗口再清
+        if started and started > time.time() + 60:
+            return False                     # 时钟回拨，无法判断，保守当活锁
+        return not _pid_alive(pid)
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(self.fd, ("%d %f" % (os.getpid(), time.time())).encode("ascii"))
+                return self
+            except FileExistsError:
+                if self._stale():
+                    try:
+                        os.remove(self.path)
+                    except OSError:
+                        pass                     # 删不掉就按普通占用走，避免空转
+                    else:
+                        continue
+                if time.time() > deadline:
+                    raise ConfigError("文件正被占用（%s），请稍后重试" % self.path)
+                time.sleep(0.15)
+
+    def __exit__(self, *_exc):
+        try:
+            if self.fd is not None:
+                os.close(self.fd)
+        finally:
+            self.fd = None
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # 没有 os.kill(pid, 0) 的等价物；用 tasklist 过滤 PID 列
+        try:
+            r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                               capture_output=True, timeout=10)
+            # 整词比较：子串匹配会让 PID 123 命中 1234，把死锁误判成活锁
+            return any(tok.strip('"') == str(pid)
+                       for tok in decode_console(r.stdout or b"").split())
+        except Exception:  # noqa: BLE001
+            return True                      # 查不出来就当它活着，宁可等
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                          # 存在但不属于我
+    except OSError:
+        return True
+    return True
+
+
+def file_lock(path: str, timeout: float = 10.0) -> _FileLock:
+    """取一把 <path>.lock 独占锁（with 语句用）。"""
+    return _FileLock(path, timeout)
+
+
+def write_atomic(path: str, text: str, encoding: str = "utf-8",
+                 newline: str | None = None) -> None:
+    """原子写文本：tmp + fsync + os.replace；失败不留 .tmp 残骸。
+
+    全仓唯一的原子写实现。此前四处各写一份，两处漏了 fsync，还有一处（已删）
+    是「截断再写」—— 读方会拿到半截内容。
+    """
+    path = str(path)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding=encoding, newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def backup_name(path: str) -> str:
+    """给 path 取一个当下没被占用的备份名。
+
+    只精确到秒时，同一秒内两次保存会互相覆盖 —— 第二次就把第一次的备份抹了，
+    而备份的意义正是在这种连续保存里回退。
+    """
+    path = str(path)
+    base = path + ".bak-" + time.strftime("%Y%m%d_%H%M%S")
+    cand, i = base, 1
+    while os.path.exists(cand):
+        i += 1
+        cand = "%s-%d" % (base, i)
+    return cand
+
+
 def _write_config(cfg, raw: dict) -> str:
-    """备份 + 原子写回配置（JSON 限定）。返回备份路径。"""
+    """备份 + 原子写回配置（JSON 限定）。返回备份路径。调用方需已持有 file_lock。"""
     import shutil
-    import time as _time
     ext = os.path.splitext(cfg.path)[1].lower()
     if ext not in (".json",):
         raise ConfigError(
             "当前配置是 %s：从界面写回会丢失注释，暂只支持 JSON 配置。"
             "请把配置改成 .json，或手工编辑后点「重新载入」。" % (ext or "未知格式"))
-    backup = cfg.path + ".bak-" + _time.strftime("%Y%m%d_%H%M%S")
+    backup = backup_name(cfg.path)
     try:
         shutil.copy2(cfg.path, backup)
     except Exception as e:  # noqa: BLE001
         raise ConfigError("备份配置失败：%s" % e)
-    tmp = cfg.path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, cfg.path)
+    write_atomic(cfg.path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n")
     return backup
+
+
+def update_config(cfg, mutate) -> str:
+    """锁内「读全文 → mutate(raw) → 原子写回」。返回备份路径。
+
+    读与写必须同在锁内：两个写者各自读了一份旧内容再写回，后写的会把前者的
+    改动整个抹掉。
+    """
+    with file_lock(cfg.path):
+        raw = load_raw(cfg.path)
+        if not isinstance(raw, dict):
+            raise ConfigError("配置根必须是对象")
+        mutate(raw)
+        return _write_config(cfg, raw)
 
 
 def save_buckets(cfg, buckets: list) -> str:
     """把桶列表写回配置文件（先备份、再原子替换）。返回备份路径。"""
     if not isinstance(buckets, list) or not buckets:
         raise ConfigError("buckets 不能为空")
-    raw = load_raw(cfg.path)
-    if not isinstance(raw, dict):
-        raise ConfigError("配置根必须是对象")
-    raw["buckets"] = buckets
-    return _write_config(cfg, raw)
+
+    def _mut(raw):
+        raw["buckets"] = buckets
+    return update_config(cfg, _mut)
 
 
 def save_config_keys(cfg, updates: dict) -> str:
     """按点路径写回若干配置项（如 aggregation.provider_url）。返回备份路径。"""
     if not isinstance(updates, dict) or not updates:
         raise ConfigError("没有要保存的配置项")
-    raw = load_raw(cfg.path)
-    if not isinstance(raw, dict):
-        raise ConfigError("配置根必须是对象")
-    for path, val in updates.items():
-        _set_path(raw, str(path), val)
-    return _write_config(cfg, raw)
+
+    def _mut(raw):
+        for path, val in updates.items():
+            _set_path(raw, str(path), val)
+    return update_config(cfg, _mut)
 
 
 def _as_list(v) -> list:
@@ -247,15 +469,15 @@ def _as_list(v) -> list:
     return [v]
 
 
-def _norm_ssh(d, base) -> dict:
-    d = d or {}
+def _norm_ssh(d, base, what="ssh") -> dict:
+    d = _as_dict(d, what)
     return {
-        "host": d.get("host") or "",
-        "user": d.get("user") or "root",
-        "port": int(d.get("port") or 22),
+        "host": _as_str(d.get("host"), what + ".host"),
+        "user": _as_str(d.get("user"), what + ".user", "root") or "root",
+        "port": _as_int(d.get("port"), what + ".port", 22),
         "key": expand_path(d.get("key"), base),
         "opts": _as_list(d.get("opts")),
-        "timeout": int(d.get("timeout") or 20),
+        "timeout": _as_int(d.get("timeout"), what + ".timeout", 20),
     }
 
 
@@ -265,18 +487,18 @@ def _norm_bucket(raw: dict, base: str, idx: int) -> dict:
     bid = str(raw.get("id") or "").strip()
     if not bid:
         raise ConfigError("buckets[%d] 缺少 id" % idx)
-    kind = (raw.get("kind") or "self").strip()
+    kind = (_as_str(raw.get("kind"), "桶 %s 的 kind" % bid, "self") or "self").strip()
     if kind not in BUCKET_KINDS:
         raise ConfigError("桶 %s 的 kind 必须是 %s" % (bid, "/".join(BUCKET_KINDS)))
-    probe = raw.get("probe") or {}
-    mode = (probe.get("mode") or "local").strip()
+    probe = _as_dict(raw.get("probe"), "桶 %s 的 probe" % bid)
+    mode = (_as_str(probe.get("mode"), "桶 %s 的 probe.mode" % bid, "local") or "local").strip()
     if mode not in PROBE_MODES:
         raise ConfigError("桶 %s 的 probe.mode 必须是 %s" % (bid, "/".join(PROBE_MODES)))
-    renew = raw.get("renew") or {}
-    rmode = (renew.get("mode") or "none").strip()
+    renew = _as_dict(raw.get("renew"), "桶 %s 的 renew" % bid)
+    rmode = (_as_str(renew.get("mode"), "桶 %s 的 renew.mode" % bid, "none") or "none").strip()
     if rmode not in RENEW_MODES:
         raise ConfigError("桶 %s 的 renew.mode 必须是 %s" % (bid, "/".join(RENEW_MODES)))
-    clone = raw.get("clone") or {}
+    clone = _as_dict(raw.get("clone"), "桶 %s 的 clone" % bid)
     return {
         "id": bid,
         "label": raw.get("label") or bid,
@@ -294,16 +516,17 @@ def _norm_bucket(raw: dict, base: str, idx: int) -> dict:
             "mode": mode,
             "socks": probe.get("socks") or "",
             "iface": probe.get("iface") or "",
-            "ssh": _norm_ssh(probe.get("ssh"), base),
-            "tries": int(probe.get("tries") or 3),
-            "timeout": int(probe.get("timeout") or 6),
+            "ssh": _norm_ssh(probe.get("ssh"), base, "桶 %s 的 probe.ssh" % bid),
+            "tries": _as_int(probe.get("tries"), "桶 %s 的 probe.tries" % bid, 3),
+            "timeout": _as_int(probe.get("timeout"), "桶 %s 的 probe.timeout" % bid, 6),
         },
         "renew": {
             "mode": rmode,
             "wan": renew.get("wan") or "",
             "iface": renew.get("iface") or "",
             "argv": renew.get("argv"),
-            "ssh": _norm_ssh(renew.get("ssh") or probe.get("ssh"), base),
+            "ssh": _norm_ssh(renew.get("ssh") or probe.get("ssh"), base,
+                             "桶 %s 的 renew.ssh" % bid),
             "gate": bool(renew.get("gate", kind == "clone")),
             "owner_label": renew.get("owner_label") or raw.get("account") or bid,
             "hint": renew.get("hint") or "",
@@ -338,7 +561,7 @@ def _norm_action(raw, base: str) -> dict:
     return {
         "argv": argv_list,
         "cwd": expand_path(raw.get("cwd"), base),
-        "timeout": int(raw.get("timeout") or 120),
+        "timeout": _as_int(raw.get("timeout"), "动作 timeout", 120),
         "confirm": raw.get("confirm") or "",
         "desc": raw.get("desc") or "",
         "show": bool(raw.get("show", True)),
@@ -353,7 +576,7 @@ def _norm_legs(raw, base: str, data_dir: str, api_fallback: str = "") -> dict:
     · full_file    ：全量定义母本，留空 = 同目录 <名>.full.yaml（首次自动播种）
     · provider_name：热更新时的 provider 名（mihomo：PUT /providers/proxies/<名>）
     """
-    d = raw if isinstance(raw, dict) else {}
+    d = _as_dict(raw, "aggregation.legs")
     pf = "" if is_unset(d.get("provider_file")) else expand_path(d.get("provider_file"), base)
     full = "" if is_unset(d.get("full_file")) else expand_path(d.get("full_file"), base)
     if pf and not full:
@@ -363,12 +586,13 @@ def _norm_legs(raw, base: str, data_dir: str, api_fallback: str = "") -> dict:
         "provider_file": pf,
         "full_file": full,
         "provider_name": "" if is_unset(d.get("provider_name"))
-                         else (d.get("provider_name") or "").strip(),
-        "api": (("" if is_unset(d.get("api")) else (d.get("api") or ""))
+                         else _as_str(d.get("provider_name"), "aggregation.legs.provider_name").strip(),
+        "api": (("" if is_unset(d.get("api"))
+                 else _as_str(d.get("api"), "aggregation.legs.api"))
                 or api_fallback or "").rstrip("/"),
         "state_file": expand_path(d.get("state_file") or "legs_excluded.json", data_dir),
-        "keep_min": max(0, int(d.get("keep_min") or 1)),
-        "backup_keep": max(0, int(d.get("backup_keep") or 10)),
+        "keep_min": max(0, _as_int(d.get("keep_min"), "aggregation.legs.keep_min", 1)),
+        "backup_keep": max(0, _as_int(d.get("backup_keep"), "aggregation.legs.backup_keep", 10)),
     }
 
 
@@ -382,30 +606,30 @@ class Cfg:
         self.path = os.path.abspath(path)
         self.base_dir = os.path.dirname(self.path)
 
-        app = raw.get("app") or {}
+        app = _as_dict(raw.get("app"), "app")
         self.data_dir = expand_path(app.get("data_dir") or "~/.bucket_console", self.base_dir)
         self.state_file = expand_path(app.get("state_file") or "state.json", self.data_dir)
         self.portal_file = expand_path(app.get("portal_file") or "portal_status.json", self.data_dir)
         self.events_file = expand_path(app.get("events_file") or "console_events.log", self.data_dir)
         self.speedtest_result = expand_path(app.get("speedtest_result") or "speedtest.json", self.data_dir)
 
-        ui = raw.get("ui") or {}
+        ui = _as_dict(raw.get("ui"), "ui")
         self.ui = {
             "title": ui.get("title") or "多桶聚合控制台",
             "tray_title": ui.get("tray_title") or "多桶聚合 · 总开关",
-            "interval_ms": int(ui.get("interval_ms") or 15000),
-            "spark_samples": int(ui.get("spark_samples") or 240),
-            "window_w": int(ui.get("window_w") or 1000),
-            "window_h": int(ui.get("window_h") or 860),
+            "interval_ms": _as_int(ui.get("interval_ms"), "ui.interval_ms", 15000),
+            "spark_samples": _as_int(ui.get("spark_samples"), "ui.spark_samples", 240),
+            "window_w": _as_int(ui.get("window_w"), "ui.window_w", 1000),
+            "window_h": _as_int(ui.get("window_h"), "ui.window_h", 860),
             "font": ui.get("font") or "",
             "mono_font": ui.get("mono_font") or "Consolas",
         }
 
-        lc = raw.get("lifecycle") or {}
+        lc = _as_dict(raw.get("lifecycle"), "lifecycle")
         self.lifecycle = {
             "heartbeat_file": expand_path(lc.get("heartbeat_file") or "ui_alive.json", self.data_dir),
             "boot_action": lc.get("boot_action") or "",
-            "boot_delay_ms": int(lc.get("boot_delay_ms") or 3000),
+            "boot_delay_ms": _as_int(lc.get("boot_delay_ms"), "lifecycle.boot_delay_ms", 3000),
             "stop_action": lc.get("stop_action") or "",
             "exit_confirm": lc.get("exit_confirm") or (
                 "退出后控制台会执行「全链停」：\n"
@@ -415,7 +639,7 @@ class Cfg:
             "on_start_remove": [expand_path(p, self.data_dir) for p in _as_list(lc.get("on_start_remove"))],
         }
 
-        pr = raw.get("probe") or {}
+        pr = _as_dict(raw.get("probe"), "probe")
         self.probe = {
             # 仍是 <占位符> 的一律视为未配置，避免拿占位符去发请求
             "target": "" if is_unset(pr.get("target")) else pr["target"],
@@ -424,12 +648,12 @@ class Cfg:
                 "WISPAccessGatewayParam", "NextURL"],
             # 丢包率：ICMP 开关 / 包数 / 目标（留空=取探活地址的主机名）
             "icmp": bool(pr.get("icmp", True)),
-            "icmp_count": int(pr.get("icmp_count") or 5),
+            "icmp_count": _as_int(pr.get("icmp_count"), "probe.icmp_count", 5),
             "ping_host": "" if is_unset(pr.get("ping_host")) else (pr.get("ping_host") or ""),
         }
 
-        ag = raw.get("aggregation") or {}
-        br = ag.get("breaker") or {}
+        ag = _as_dict(raw.get("aggregation"), "aggregation")
+        br = _as_dict(ag.get("breaker"), "aggregation.breaker")
         self.aggregation = {
             "api": "" if is_unset(ag.get("api")) else (ag["api"] or "").rstrip("/"),
             "group": "" if is_unset(ag.get("group")) else (ag.get("group") or ""),
@@ -445,21 +669,21 @@ class Cfg:
             # 决策在本控制台，执行走 actions.isolate_leg / restore_leg（用户自己配置的命令）。
             "breaker": {
                 "enabled": bool(br.get("enabled", True)),
-                "threshold_pct": int(br.get("threshold_pct", 50)),
-                "trip_after": int(br.get("trip_after", 2)),
-                "recover_below_pct": int(br.get("recover_below_pct", 10)),
-                "recover_after": int(br.get("recover_after", 3)),
-                "tries": int(br.get("tries", 5)),
-                "interval_s": max(15, int(br.get("interval_s", 60))),
-                "keep_min": max(0, int(br.get("keep_min", 1))),
-                "start_delay_s": max(0, int(br.get("start_delay_s", 12))),
+                "threshold_pct": _as_int(br.get("threshold_pct"), "breaker.threshold_pct", 50),
+                "trip_after": _as_int(br.get("trip_after"), "breaker.trip_after", 2),
+                "recover_below_pct": _as_int(br.get("recover_below_pct"), "breaker.recover_below_pct", 10),
+                "recover_after": _as_int(br.get("recover_after"), "breaker.recover_after", 3),
+                "tries": _as_int(br.get("tries"), "breaker.tries", 5),
+                "interval_s": max(15, _as_int(br.get("interval_s"), "breaker.interval_s", 60)),
+                "keep_min": max(0, _as_int(br.get("keep_min"), "breaker.keep_min", 1)),
+                "start_delay_s": max(0, _as_int(br.get("start_delay_s"), "breaker.start_delay_s", 12)),
             },
             # 腿列表维护（供随附的 leg_ctl.py 使用；不填则熔断只做采样与提示）
             "legs": _norm_legs(ag.get("legs"), self.base_dir, self.data_dir,
                                "" if is_unset(ag.get("api")) else (ag.get("api") or "")),
         }
 
-        po = raw.get("portal") or {}
+        po = _as_dict(raw.get("portal"), "portal")
         self.portal = {
             "global_tok_file": expand_path(po.get("global_tok_file"), self.data_dir),
             "per_account_pattern": po.get("per_account_pattern") or "portal_tok_{account}.txt",
@@ -470,7 +694,7 @@ class Cfg:
             "accounts": [str(a) for a in _as_list(po.get("accounts"))],
         }
 
-        vm = raw.get("vm") or {}
+        vm = _as_dict(raw.get("vm"), "vm")
         self.vm = {
             "enabled": bool(vm.get("enabled", False)),
             "label": vm.get("label") or "虚拟路由",
@@ -483,7 +707,7 @@ class Cfg:
             raise ConfigError("buckets 不能为空：至少配置一个桶")
 
         self.actions = {str(k): _norm_action(v, self.base_dir)
-                        for k, v in (raw.get("actions") or {}).items()
+                        for k, v in _as_dict(raw.get("actions"), "actions").items()
                         if not str(k).startswith("_")}   # 跳过 _note 等说明键
 
         self.tasks = []

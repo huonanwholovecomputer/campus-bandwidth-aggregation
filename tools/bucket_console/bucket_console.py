@@ -54,6 +54,10 @@ from console_config import (  # noqa: E402
     new_bucket_template, normalize_mac, safe_console, save_buckets,
     save_config_keys, validate_bucket,
 )
+import console_config as _cc  # noqa: E402  共用解码 / 原子写
+
+# 控制台输出解码（utf-8 → cp936 → latin-1），实现在 console_config 里与其它入口共用
+_decode_console = _cc.decode_console
 
 try:
     import probe_buckets as PB
@@ -251,20 +255,6 @@ def parse_geometry(geo):
         return None
 
 
-def _decode_console(b):
-    """子进程输出解码：UTF-8 → CP936 → Latin-1 依次尝试。
-
-    schtasks 的状态文本会随控制台代码页在 "Ready" 与「准备就绪」之间变化，
-    固定 utf-8 解码会得到 U+FFFD 乱码（2026-09-09 由内部测试版回灌）。
-    """
-    for enc in ("utf-8", "cp936", "latin-1"):
-        try:
-            return b.decode(enc)
-        except Exception:
-            continue
-    return b.decode("utf-8", "replace")
-
-
 # schtasks 状态文本本地化差异 → 统一成英文规范值（界面按英文值判色）
 _TASK_STATE_MAP = {
     "ready": "Ready", "就绪": "Ready", "准备就绪": "Ready",
@@ -288,7 +278,13 @@ def task_state(name):
         r = subprocess.run(["schtasks.exe", "/Query", "/TN", name, "/FO", "CSV", "/NH"],
                            capture_output=True, timeout=15, creationflags=NO_WINDOW)
         if r.returncode != 0:
-            return "不存在"
+            # 非零退出 ≠ 任务不存在：权限不足、任务计划服务没起来都会非零。
+            # 一律报「不存在」会让界面把一个存在的问题显示成「不存在」，用户照着去建反而更乱。
+            msg = (_decode_console(r.stderr or b"") or _decode_console(r.stdout or b"")).strip()
+            flat = " ".join(msg.split())
+            if "找不到" in flat or "cannot find" in flat.lower():
+                return "不存在"
+            return "ERR %s" % (flat[:80] or ("schtasks 退出码 %d" % r.returncode))
         txt = _decode_console(r.stdout or b"")
         for row in csv.reader(txt.splitlines()):
             if len(row) < 3:
@@ -300,6 +296,45 @@ def task_state(name):
         return "未知"
     except Exception as e:  # noqa: BLE001
         return "ERR %s" % e
+
+
+def portal_fresh_enough(age_min, max_age_min):
+    """真机闸的新鲜度判定（fail-closed）。返回 (是否放行, 原因的人话说法)。
+
+    读不到时间戳、或产物已超过阈值，一律判「无法验证」不放行：刷新动作失败时门户
+    产物会保留上一次内容，拿过期判定去踢人比不放行更糟。抽成纯函数是为了能直接断言
+    行为 —— 之前这条只有源码子串检查，把逻辑整个取反也照样通过。
+    """
+    if age_min is None:
+        return False, "读取失败"
+    if age_min > max_age_min:
+        return False, "%.1f 分钟前" % age_min
+    return True, ""
+
+
+def tail_log(path, n=150):
+    """读事件日志的尾部 n 行 + 总行数。返回 (文本, 总行数)。
+
+    长跑日志会到几十万行，而界面每轮刷新都要显示一次：readlines() 每次都把全文读成
+    list[str]，内存随日志无界增长。这里按块扫，内存只跟块大小和 n 有关。
+    """
+    tail = deque(maxlen=n)
+    carry = b""
+    total = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 16)
+            if not chunk:
+                break
+            total += chunk.count(b"\n")
+            parts = (carry + chunk).split(b"\n")
+            carry = parts.pop()            # 末尾这段可能还没读完，留到下一块
+            for p in parts:
+                tail.append(_decode_console(p) + "\n")
+    if carry:
+        tail.append(_decode_console(carry))
+        total += 1                          # 文件末尾没有换行符，还有一行
+    return "".join(tail), total
 
 
 def open_path(path):
@@ -366,17 +401,8 @@ def set_proxy_mode(cfg, target, log=None):
     log("proxy-toggle 目标=%s (当前=%s)" % (target, cur))
     try:
         # 原子写（2026-09-09 由内部测试版回灌）：控制台每 15s 读模式文件判定代理态，
-        # 先截断再写会让读方拿到半截内容。
-        _mf = cfg.aggregation["mode_file"]
-        _tmp = _mf + ".tmp"
-        _dir = os.path.dirname(_mf)
-        if _dir:
-            os.makedirs(_dir, exist_ok=True)
-        with open(_tmp, "w", encoding="ascii") as f:
-            f.write(target + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(_tmp, _mf)
+        # 先截断再写会让读方拿到半截内容。实现统一走 console_config.write_atomic。
+        _cc.write_atomic(cfg.aggregation["mode_file"], target + "\n", encoding="ascii")
     except Exception as e:  # noqa: BLE001
         return False, "写模式文件失败：%s" % e
     exec_action(cfg, cfg.aggregation.get("restart_action") or "restart_aggregator")
@@ -1983,14 +2009,6 @@ class App:
         return bool(self.cfg.aggregation.get("api")) and self.cfg.has_action(
             self.cfg.aggregation.get("restart_action") or "restart_aggregator")
 
-    def _write_mode_file(self, mode):
-        try:
-            with open(self.cfg.aggregation["mode_file"], "w", encoding="ascii") as f:
-                f.write(mode + "\n")
-            return True
-        except Exception:
-            return False
-
     def act_proxy_toggle(self):
         """暂停代理（切直连配置重启）↔ 恢复代理（切回规则配置重启）。"""
         if not self._proxy_available():
@@ -2363,13 +2381,12 @@ class App:
 
     def _fill_log(self):
         try:
-            with open(self.cfg.events_file, "r", encoding="utf-8-sig") as f:
-                lines = f.readlines()
+            text, total = tail_log(self.cfg.events_file)
             self.txt_log.config(state="normal")
             self.txt_log.delete("1.0", "end")
-            self.txt_log.insert("1.0", "".join(lines[-150:]))
+            self.txt_log.insert("1.0", text)
             self.txt_log.config(state="disabled")
-            self.lbl_loginfo.config(text="%d 行" % len(lines))
+            self.lbl_loginfo.config(text="%d 行" % total)
         except Exception as e:  # noqa: BLE001
             self.txt_log.config(state="normal")
             self.txt_log.delete("1.0", "end")
@@ -3590,10 +3607,10 @@ class App:
         except Exception:
             max_age = 3.0
         age = file_age_min(self.cfg.portal_file)
-        if age is None or age > max_age:
+        fresh, why = portal_fresh_enough(age, max_age)
+        if not fresh:
             return False, ("门户判定数据已过期（%s，阈值 %.0f 分钟）：刷新动作可能失败。"
-                           "按纪律拦截；请先手动刷新门户确认。"
-                           % ("读取失败" if age is None else "%.1f 分钟前" % age, max_age))
+                           "按纪律拦截；请先手动刷新门户确认。" % (why, max_age))
         t = self._clone_target(bucket, pv)
         if t is None:
             return False, "无该账号的判定数据（缺其专属凭据？）。按互顶纪律拦截。"

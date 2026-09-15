@@ -35,6 +35,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -137,13 +138,58 @@ def _lock_path() -> str:
     return store_path() + ".lock"
 
 
+def _pid_alive(pid: int) -> bool:
+    """持锁进程还在吗？（查不出来一律当它活着，宁可等也不要误删活锁）"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                               capture_output=True, timeout=10)
+            # 整词比较：子串匹配会让 PID 123 命中 1234，把死锁误判成活锁
+            out = (r.stdout or b"").decode("utf-8", "replace")
+            return any(tok.strip('"') == str(pid) for tok in out.split())
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class _Lock:
-    """跨进程独占锁（O_EXCL 创建，超时放弃）。"""
+    """跨进程独占锁（O_EXCL 创建，超时放弃）+ 死锁回收。
+
+    锁文件在进程被 Ctrl+C / kill 之后会残留，而 PID 虽然写进去了旧实现却从不读回，
+    于是之后每次写入都要等满超时再失败，只能人工删 .lock（相当于凭据库永久只读）。
+    这里记下 PID 与持锁时刻：超时后若持锁进程已经不在了，就把这个死锁清掉重试。
+    """
 
     def __init__(self, path: str, timeout: float = LOCK_TIMEOUT):
         self.path = path
         self.timeout = timeout
         self.fd = None
+
+    def _stale(self) -> bool:
+        try:
+            age = time.time() - os.path.getmtime(self.path)
+        except OSError:
+            return True                      # 读不到 = 已被释放，重试即可
+        if age > max(60.0, self.timeout * 6):
+            return True                      # 比任何一次正常持锁都久：当残留
+        try:
+            with open(self.path, "r", encoding="ascii", errors="replace") as f:
+                fields = f.read().split()
+            pid = int(fields[0])
+            started = float(fields[1]) if len(fields) > 1 else 0.0
+        except Exception:  # noqa: BLE001
+            return age > self.timeout        # 内容不可读：给足一个等待窗口再清
+        if started and started > time.time() + 60:
+            return False                     # 时钟回拨，判断不了，保守当活锁
+        return not _pid_alive(pid)
 
     def __enter__(self):
         deadline = time.time() + self.timeout
@@ -151,9 +197,16 @@ class _Lock:
         while True:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.write(self.fd, str(os.getpid()).encode())
+                os.write(self.fd, ("%d %f" % (os.getpid(), time.time())).encode("ascii"))
                 return self
             except FileExistsError:
+                if self._stale():
+                    try:
+                        os.remove(self.path)
+                    except OSError:
+                        pass                     # 删不掉就按普通占用走，避免空转
+                    else:
+                        continue
                 if time.time() > deadline:
                     raise TimeoutError("凭据库被占用（%s），请稍后重试" % self.path)
                 time.sleep(0.15)

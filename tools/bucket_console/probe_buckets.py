@@ -35,7 +35,8 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from console_config import (ConfigError, default_config_path,  # noqa: E402
-                            is_unset, load_config, safe_console)
+                            decode_console, file_lock, is_unset, load_config,
+                            safe_console, write_atomic)
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 DEVNULL = os.devnull
@@ -70,12 +71,13 @@ def run(argv, timeout=20, shell=False, env=None):
     """执行命令并返回 (rc, stdout)。rc=None 表示超时/异常。
 
     env 传 probe_env() 即绕开宿主机代理（探活用；显式 -x 不受影响）。
+    输出按 utf-8 → cp936 → latin-1 解码：中文 Windows 的 ping 汇总行是 CP936，
+    固定 utf-8 解出来是乱码（数字仍可解析，但显示难看且日志里搜不到）。
     """
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, shell=shell, env=env,
-                           creationflags=NO_WINDOW)
-        return r.returncode, (r.stdout or "").strip()
+        r = subprocess.run(argv, capture_output=True, timeout=timeout, shell=shell,
+                           env=env, creationflags=NO_WINDOW)
+        return r.returncode, decode_console(r.stdout or b"").strip()
     except subprocess.TimeoutExpired:
         return None, "ERR: 超时"
     except Exception as e:  # noqa: BLE001
@@ -143,12 +145,13 @@ def icmp_loss_pct(cfg, bucket, count=None):
         rc, out = run(args, timeout=to)
     if rc is None:
         return None, out
-    m = re.search(r"(\d+)\s*%", out or "")
+    # 只认汇总行（最后一行非空）里的百分比：整段搜第一个 \d+% 会被非汇总行带偏
+    lines = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
+    summary = lines[-1] if lines else ""
+    m = re.search(r"(\d+)\s*%", summary)
     if not m:
-        tail = (out or "").strip().splitlines()[-1:] or [""]
-        return None, "未识别 ping 汇总行：%s" % tail[0][:80]
-    last = (out or "").strip().splitlines()[-1:] or [""]
-    return int(m.group(1)), last[0][:120]
+        return None, "未识别 ping 汇总行：%s" % summary[:80]
+    return int(m.group(1)), summary[:120]
 
 
 def probe_bucket(cfg, bucket, tries=None, timeout=None, target=None):
@@ -187,7 +190,8 @@ def probe_bucket(cfg, bucket, tries=None, timeout=None, target=None):
             codes.append(out if (out and out.isdigit()) else "000")
         if any(c != "204" for c in codes):
             rc, body = run(ssh_argv(ssh_cfg,
-                                    "curl -s -m %d --noproxy '*' %s%s" % (timeout, iface_arg, tgt)),
+                                    "curl -s -m %d --noproxy '*' %s%s"
+                                    % (timeout, iface_arg, tgt)),
                            timeout=timeout + 12)
             body = body if rc == 0 else ""
         if iface:
@@ -250,15 +254,17 @@ def _load_state(path):
 
 
 def write_state(cfg, updates, keep=True):
-    """原子写入状态文件（默认与旧状态合并，避免单桶探测抹掉其它桶）。"""
-    os.makedirs(os.path.dirname(cfg.state_file) or ".", exist_ok=True)
-    st = _load_state(cfg.state_file) if keep else {}
-    st.update(updates)
-    st["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    tmp = cfg.state_file + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, cfg.state_file)
+    """原子写入状态文件（默认与旧状态合并，避免单桶探测抹掉其它桶）。
+
+    读-改-写整段在锁内：控制台与巡检任务可能同时写同一份状态，锁外读、
+    锁内写等于没锁。
+    """
+    with file_lock(cfg.state_file):
+        st = _load_state(cfg.state_file) if keep else {}
+        st.update(updates)
+        st["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        write_atomic(cfg.state_file,
+                     json.dumps(st, ensure_ascii=False, indent=2) + "\n")
     return st
 
 
