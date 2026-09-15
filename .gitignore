@@ -9,6 +9,18 @@ drafts/
 *.private.*
 *_real_*
 
+# 控制台（tools/bucket_console）运行时产物。正常都落在 app.data_dir（~/.bucket_console），
+# 但 app.data_dir / portal.tok_dir 一旦被指到仓库内，这些东西也绝不能入库：
+# portal_tok*.txt 是逐账号门户凭据（docs/00 红线 5），state/portal_status 含真实 MAC 与 IP。
+portal_tok*.txt
+state.json
+portal_status.json
+speedtest.json
+ui_state.json
+breaker_state.json
+legs_excluded.json
+aggregator_mode.txt
+
 # Python 产物（控制台工具运行时生成）
 __pycache__/
 *.pyc

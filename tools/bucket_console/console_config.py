@@ -463,7 +463,9 @@ class Cfg:
         self.portal = {
             "global_tok_file": expand_path(po.get("global_tok_file"), self.data_dir),
             "per_account_pattern": po.get("per_account_pattern") or "portal_tok_{account}.txt",
-            "tok_dir": expand_path(po.get("tok_dir") or self.data_dir, self.base_dir),
+            # 基准是 data_dir，与 global_tok_file 一致；不用配置文件目录 —— 否则
+            # tok_dir 填一个相对路径（模板旧默认值就是 "."）会把逐账号凭据写进仓库树内。
+            "tok_dir": expand_path(po.get("tok_dir") or self.data_dir, self.data_dir),
             "owner_field": po.get("owner_field") or "tokenOwner",
             "accounts": [str(a) for a in _as_list(po.get("accounts"))],
         }

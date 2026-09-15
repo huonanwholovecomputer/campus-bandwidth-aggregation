@@ -97,10 +97,10 @@
   },
 
   "portal": {
-    "_note": "门户查询产物与凭据文件约定（产物由你的门户查询脚本写入 app.portal_file）。max_age_min = 真机闸允许的门户产物最大陈旧分钟数，超过按「无法验证」拦截（fail-closed）",
+    "_note": "门户查询产物与凭据文件约定（产物由你的门户查询脚本写入 app.portal_file）。max_age_min = 真机闸允许的门户产物最大陈旧分钟数，超过按「无法验证」拦截（fail-closed）。tok_dir 留空 = 用 app.data_dir；填相对路径时基准同样是 app.data_dir（不是配置目录）—— 凭据属于 docs/00 红线 5，绝不要放在仓库目录里",
     "global_tok_file": "portal_tok.txt",
     "per_account_pattern": "portal_tok_{account}.txt",
-    "tok_dir": ".",
+    "tok_dir": "",
     "owner_field": "tokenOwner",
     "max_age_min": 3,
     "accounts": ["<账号甲>", "<账号乙>"]
