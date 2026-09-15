@@ -62,8 +62,10 @@ python bucket_console.py                     # 再开界面
 
 ## 功能演示
 
-> 下列截图来自本项目控制台的实际运行界面。所有可识别标识（品牌名、本机绝对路径、账号、MAC、SSH 地址）均已打码；
-> 图中的桶名、接口名、label 与数值均为**演示用示例值**，不对应任何真实环境。演示截图的脱敏要求见 [docs/00_脱敏与贡献规范.md](docs/00_脱敏与贡献规范.md) §4.3。
+> 下列截图来自作者本机的控制台，与仓库内 `tools/bucket_console/` **同构**（界面结构、按钮语义、生命周期模型一致），
+> 个别按钮文案可能随版本略有差异。所有可识别标识（品牌名、本机绝对路径、账号、MAC、SSH 地址）均已打码，
+> **速率读数已按 §2.1 遮挡**；图中的桶名、接口名与 label 为演示用示例值，不指向任何真实环境。
+> 演示截图的脱敏要求见 [docs/00_脱敏与贡献规范.md](docs/00_脱敏与贡献规范.md) §4.3。
 
 ### 1. 简单控制台：一眼看桶状态
 
@@ -87,7 +89,8 @@ python bucket_console.py                     # 再开界面
 ![聚合出口速率](assets/screenshots/aggregated-throughput.jpg)
 
 多会话腿同时在线时，出口链路（图中为以太网）的接收速率进入**两百 Mbps 档位**，高于单会话上限——
-这就是本方案要拿到的东西。速率的具体判定与验证方法见 [experiments/verify_aggregation.md](experiments/verify_aggregation.md)。
+这就是本方案要拿到的东西（图中该读数已遮挡，量级表述遵守 [docs/00_脱敏与贡献规范.md](docs/00_脱敏与贡献规范.md) §2.1）。
+速率的具体判定与验证方法见 [experiments/verify_aggregation.md](experiments/verify_aggregation.md)。
 
 ## 环境前提（动手前先自查）
 
