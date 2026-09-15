@@ -145,6 +145,30 @@ def _str_or(v, default: str = "") -> str:
     return v if isinstance(v, str) else str(v)
 
 
+_CMD_SPECIAL_RE = re.compile(r'[\s&|<>^"()]')
+
+
+def quote_shell(v) -> str:
+    """把要拼进命令串的值转义（argv 是字符串时走 shell=True）。
+
+    必须分平台：shlex.quote 是 POSIX 规则，cmd.exe 不认单引号，套上去会变成命令的
+    一部分。Windows 侧用双引号 —— 实测 cmd 的双引号能挡住空格与 & | < > ^，
+    内嵌双引号转义成 \\" 也能正确还原。
+
+    唯一挡不住的是 cmd 的 %VAR% 展开（实测 %% 只会变成字面两个百分号，不能当中和手段）。
+    含 % 的值请改用列表 argv（problems() 不再重复告警：% 在 iface/账号/地址里不常见，
+    且展开只影响环境变量，不构成命令注入）。
+    """
+    v = str(v)
+    if os.name != "nt":
+        return shlex.quote(v)
+    if v == "":
+        return '""'
+    if not _CMD_SPECIAL_RE.search(v):
+        return v
+    return '"' + v.replace('"', '\\"') + '"'
+
+
 def _as_int(v, what: str, default: int = 0) -> int:
     if v is None or v == "":
         return default
@@ -170,6 +194,8 @@ def expand_path(p, base=None) -> str:
 # --------------------------------------------------------------------------
 MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 BUCKET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,31}$")
+# 接口名会被拼进远端命令（ping -I / curl --interface）与 ifup，先卡一道白名单
+IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,31}$")
 
 
 def mac_ok(v) -> bool:
@@ -758,10 +784,13 @@ class Cfg:
     _SUBST_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
     @classmethod
-    def _subst(cls, text: str, s: dict) -> str:
+    def _subst(cls, text: str, s: dict, quote: bool = False) -> str:
         def rep(m):
             k = m.group(1)
-            return str(s[k]) if k in s else m.group(0)
+            if k not in s:
+                return m.group(0)
+            v = str(s[k])
+            return quote_shell(v) if quote else v
         return cls._SUBST_RE.sub(rep, text)
 
     def argv_for(self, name: str, bucket: dict | None = None, **extra):
@@ -772,7 +801,10 @@ class Cfg:
         s = self.subs(bucket, **extra)
         argv = a["argv"]
         if isinstance(argv, str):
-            return self._subst(argv, s)
+            # 字符串命令走 shell=True：替换进去的值必须先转义。account / iface /
+            # target / wan 里有一部分直接来自门户产物，是不可信输入；不转义时
+            # 一个空格就换参数、一个 & 或 ; 就能接着跑第二条命令。
+            return self._subst(argv, s, quote=True)
         return [self._subst(str(x), s) for x in argv]
 
     def problems(self) -> list[str]:
@@ -803,6 +835,26 @@ class Cfg:
                 out.append("桶 %s：克隆桶缺 clone.portal_id" % b["id"])
             if b.get("kind") == "clone" and c.get("gate", True) and not b.get("account"):
                 out.append("桶 %s：克隆桶开了真机闸但未填 account（判定会一直未知→拦截）" % b["id"])
+            # 这些值会被拼进远端 shell 命令，先卡白名单。只查真正走 ssh 的桶：
+            # 本机 Windows 网卡名（中文/带空格）也会出现在 probe.iface 里，
+            # 那种值只会经 {iface} 替换进 argv（字符串 argv 已在 argv_for 里转义），
+            # 不该在这里被当成非法。
+            _ssh_iface = []
+            if p.get("mode") == "ssh":
+                _ssh_iface.append(("probe.iface", p.get("iface")))
+            if r.get("mode") == "ssh_ifup":
+                _ssh_iface += [("renew.iface", r.get("iface")), ("renew.wan", r.get("wan"))]
+            for fld, val in _ssh_iface:
+                if val and not is_unset(val) and not IFACE_RE.match(str(val)):
+                    out.append("桶 %s：%s=%r 不是合法接口名（会拼进远端命令，"
+                               "只允许字母数字开头的 [A-Za-z0-9_.:@-]，最长 32）" % (b["id"], fld, val))
+            for fld, val in (("probe.ssh.host", (p.get("ssh") or {}).get("host")),
+                             ("renew.ssh.host", (r.get("ssh") or {}).get("host")),
+                             ("probe.socks", p.get("socks"))):
+                if val and str(val).startswith("-"):
+                    # 以 '-' 开头会被 ssh / curl 当成选项（如 -o ProxyCommand=…）
+                    out.append("桶 %s：%s=%r 以 '-' 开头，会被 ssh/curl 当成命令行选项"
+                               % (b["id"], fld, val))
         lg = self.aggregation.get("legs") or {}
         pf, full = lg.get("provider_file") or "", lg.get("full_file") or ""
         if pf and full and os.path.abspath(pf) == os.path.abspath(full):

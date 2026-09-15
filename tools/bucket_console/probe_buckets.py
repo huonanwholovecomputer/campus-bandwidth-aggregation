@@ -31,10 +31,11 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from shlex import quote as shquote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from console_config import (ConfigError, default_config_path,  # noqa: E402
+from console_config import (IFACE_RE, ConfigError, default_config_path,  # noqa: E402
                             decode_console, file_lock, is_unset, load_config,
                             safe_console, write_atomic)
 
@@ -95,9 +96,24 @@ def ssh_argv(ssh_cfg, remote_cmd):
         args += ["-p", str(ssh_cfg["port"])]
     for opt in ssh_cfg.get("opts") or []:
         args += ["-o", str(opt)]
+    args.append("--")   # 到此为止都是选项：host 以 '-' 开头时不会被当成 ssh 的开关
     args.append("%s@%s" % (ssh_cfg.get("user") or "root", ssh_cfg.get("host") or ""))
     args.append(remote_cmd)
     return args
+
+
+def _remote_iface(pr) -> tuple[str, str]:
+    """远端命令里要用的接口名。返回 (iface, 错误说明)；接口名非法时 iface 为空。
+
+    接口名会被原样拼进 OpenWrt 侧的 shell 命令，所以先卡白名单 —— 它来自配置，
+    但不是「用户当场敲的」，一个空格就能改命令语义。
+    """
+    iface = (pr.get("iface") or "").strip()
+    if not iface:
+        return "", ""
+    if not IFACE_RE.match(iface):
+        return "", "iface=%r 不是合法接口名（只允许字母数字开头的 [A-Za-z0-9_.:@-]，最长 32）" % iface
+    return iface, ""
 
 
 def _curl_base(cfg, timeout):
@@ -134,8 +150,11 @@ def icmp_loss_pct(cfg, bucket, count=None):
         ssh_cfg = pr.get("ssh") or {}
         if is_unset(ssh_cfg.get("host")):
             return None, "ssh 探测缺少 probe.ssh.host"
-        iface = pr.get("iface") or ""
-        cmd = "ping -c %d -W 2 %s%s" % (count, ("-I %s " % iface) if iface else "", host)
+        iface, err = _remote_iface(pr)
+        if err:
+            return None, err
+        cmd = "ping -c %d -W 2 %s%s" % (
+            count, ("-I %s " % shquote(iface)) if iface else "", shquote(host))
         rc, out = run(ssh_argv(ssh_cfg, cmd), timeout=to)
     else:
         if os.name == "nt":
@@ -178,26 +197,29 @@ def probe_bucket(cfg, bucket, tries=None, timeout=None, target=None):
             return {"codes": [], "state": "n/a", "portal": False, "body": "",
                     "detail": "ssh 探测缺少 probe.ssh.host",
                     "http_loss": None, "icmp_loss": None}
-        iface = pr.get("iface") or ""
-        iface_arg = ("--interface %s " % iface) if iface else ""
+        iface, err = _remote_iface(pr)
+        if err:
+            return {"codes": [], "state": "n/a", "portal": False, "body": "",
+                    "detail": err, "http_loss": None, "icmp_loss": None}
+        iface_arg = ("--interface %s " % shquote(iface)) if iface else ""
         # 远端 curl 也显式 --noproxy：设备侧若残留代理变量，同样会把探活带偏。
         # （远端这里只用 --interface 选源，不用 -x，所以 --noproxy 不会误伤显式代理。）
         for _ in range(tries):
             rc, out = run(ssh_argv(ssh_cfg,
                                    "curl -s -m %d --noproxy '*' -o /dev/null -w '%%{http_code}' %s%s"
-                                   % (timeout, iface_arg, tgt)),
+                                   % (timeout, iface_arg, shquote(tgt))),
                           timeout=timeout + 12)
             codes.append(out if (out and out.isdigit()) else "000")
         if any(c != "204" for c in codes):
             rc, body = run(ssh_argv(ssh_cfg,
                                     "curl -s -m %d --noproxy '*' %s%s"
-                                    % (timeout, iface_arg, tgt)),
+                                    % (timeout, iface_arg, shquote(tgt))),
                            timeout=timeout + 12)
             body = body if rc == 0 else ""
         if iface:
             rc, ip = run(ssh_argv(ssh_cfg,
                                   "ip -4 addr show %s 2>/dev/null | grep -o 'inet [0-9.]*' | head -1"
-                                  % iface), timeout=timeout + 12)
+                                  % shquote(iface)), timeout=timeout + 12)
             detail = "远端 %s %s" % (iface, (ip or "(无IP)") if rc == 0 else "(查询失败)")
     else:
         base = _curl_base(cfg, timeout)

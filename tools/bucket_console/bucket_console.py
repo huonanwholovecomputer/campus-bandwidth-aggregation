@@ -44,6 +44,7 @@ import tkinter as tk
 import urllib.parse
 import urllib.request
 from collections import deque
+from shlex import quote as shquote
 from tkinter import ttk, messagebox, simpledialog
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -3678,7 +3679,18 @@ class App:
             return
 
         def f():
-            cmd = "ifup %s 2>/dev/null; sleep 6; ip -4 addr show %s 2>/dev/null | grep -o 'inet [0-9.]*' | head -1" % (wan, iface)
+            # wan / iface 原样拼进远端 shell：先把非法的挡掉，再按 POSIX 规则转义。
+            # （审计点名的注入点；设备侧是 busybox shell，用 shlex.quote 是对的。）
+            for _nm, _v in (("renew.wan", wan), ("renew.iface", iface)):
+                if _v and not _cc.IFACE_RE.match(_v):
+                    self.root.after(0, lambda n=_nm, v=_v: self._show_result(
+                        "续 %s 结果" % bucket["id"],
+                        "%s=%r 不是合法接口名（只允许字母数字开头的 [A-Za-z0-9_.:@-]，最长 32），"
+                        "已拒绝执行。" % (n, v)))
+                    return
+            _q = shquote
+            cmd = ("ifup %s 2>/dev/null; sleep 6; ip -4 addr show %s 2>/dev/null"
+                   " | grep -o 'inet [0-9.]*' | head -1" % (_q(wan), _q(iface)))
             rc, out = run(PB.ssh_argv(renew["ssh"], cmd),
                           timeout=int(renew["ssh"].get("timeout") or 20) + 20)
             txt = out or "%s 未取到新 IP（可能已被拒绝）" % iface
