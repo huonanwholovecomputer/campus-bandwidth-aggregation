@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from console_config import (ConfigError, default_config_path,  # noqa: E402
                             load_config, safe_console)
+import console_config as _cc  # noqa: E402  共用锁 / 原子写 / 备份名
 
 RC_OK, RC_CFG, RC_LEGS, RC_KEEP, RC_RELOAD = 0, 2, 3, 4, 5
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -51,6 +52,8 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _NAME_RE = re.compile(r"^\s*-\s*name:\s*(.+?)\s*$")
 _SERVER_RE = re.compile(r"^\s*server:\s*(.+?)\s*$")
 _PORT_RE = re.compile(r"^\s*port:\s*(\d+)\s*$")
+# 顶层的 `key:`（顶格、非缩进、非列表项）—— 用来切出 `proxies:` 段的边界
+_TOPLEVEL_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_\-]*)\s*:")
 
 
 def _unquote(s: str) -> str:
@@ -61,10 +64,47 @@ def _unquote(s: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# 腿列表解析 / 渲染（文本级，保留注释与缩进，不依赖 PyYAML）
+# provider 文件分段
 # --------------------------------------------------------------------------
-def parse_legs(text: str) -> list[dict]:
-    """把节点列表拆成 [{name, server, port, block}]。
+def split_provider(text: str) -> tuple[str, str, str]:
+    """把 provider 文件切成 (段头, 腿正文, 其余段)，只认顶层的 `proxies:` 段。
+
+    为什么必须切分：旧实现把「上一个 `- name:` 到下一个 `- name:`」之间的所有行都
+    归进上一条腿，于是 `proxy-groups:` / `rules:` 这些后续段的段头会被吸进最后一条
+    腿里。那条腿一旦被剔除，段头随之消失 —— 组定义被当成节点写进 proxies，
+    `rules: - MATCH,某组` 变成悬空引用，且随即经热更新生效。
+
+    找不到顶层 `proxies:` 时返回 ("", 全文, "")，由调用方决定当裸列表处理还是拒绝。
+    """
+    lines = (text or "").splitlines(keepends=True)
+    start = None
+    for i, ln in enumerate(lines):
+        m = _TOPLEVEL_KEY_RE.match(ln)
+        if m and m.group(1) == "proxies":
+            start = i
+            break
+    if start is None:
+        return "", text, ""
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        m = _TOPLEVEL_KEY_RE.match(lines[j])
+        if m and m.group(1) != "proxies":
+            end = j
+            break
+    return "".join(lines[:start + 1]), "".join(lines[start + 1:end]), "".join(lines[end:])
+
+
+def _toplevel_keys(text: str) -> list[str]:
+    out = []
+    for ln in (text or "").splitlines():
+        m = _TOPLEVEL_KEY_RE.match(ln)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def _parse_blocks(text: str) -> list[dict]:
+    """把「裸的节点列表正文」拆成 [{name, server, port, block}]。
 
     只识别「块状写法」（每项以 `- name: xxx` 开头）；遇到 `- {name: ...}` 这种
     流式写法会抛 ValueError —— 宁可不做，也不能猜错把腿弄丢。
@@ -94,18 +134,31 @@ def parse_legs(text: str) -> list[dict]:
     return blocks
 
 
+def parse_legs(text: str) -> list[dict]:
+    """解析腿列表：只看顶层 `proxies:` 段，其余段一概不碰。"""
+    head, body, _tail = split_provider(text)
+    if not head and _toplevel_keys(text):
+        raise ValueError(
+            "找不到顶层 `proxies:` 段，但文件里还有别的段（%s）—— 分不清哪一段是腿列表，"
+            "拒绝改动（把节点列表放进 `proxies:` 段，或让本文件只放一份裸列表）"
+            % ", ".join(sorted(set(_toplevel_keys(text)))))
+    return _parse_blocks(body)
+
+
 def render_legs(full_text: str, excluded) -> str:
-    """按剔除集合重拼 provider 文件内容（母本顺序保持不变）。"""
+    """按剔除集合重拼 provider 文件内容（母本顺序不变，其余段原样保留）。"""
     blocks = parse_legs(full_text)
     ex = set(excluded or ())
     keep = [b for b in blocks if b["name"] not in ex]
-    idx = (full_text or "").find("- name:")
-    prefix = full_text[:idx] if idx > 0 else ""
-    if not prefix.strip():
-        prefix = "proxies:\n"
+    head, _body, tail = split_provider(full_text)
+    if not head:
+        head = "proxies:\n"
     body = "\n".join(b["block"] for b in keep)
     # rstrip 去掉 `- name:` 那一行残留的缩进（否则会多出一行只有空格的空行）
-    return prefix.rstrip() + "\n" + (body + "\n" if body else "")
+    out = head.rstrip("\n") + "\n" + (body + "\n" if body else "")
+    if tail.strip():
+        out += tail.strip("\n") + "\n"
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -127,18 +180,12 @@ def load_state(cfg) -> dict:
 def save_state(cfg, d: dict) -> bool:
     path = state_path(cfg)
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         d = dict(d)
         d["_note"] = ("腿剔除集合（leg_ctl.py 维护）：excluded 里的腿不会出现在 provider_file 里；"
                       "删除本文件等于「全部放回」，再跑一次 sync 即可")
         d["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        with _cc.file_lock(path):
+            _cc.write_atomic(path, json.dumps(d, ensure_ascii=False, indent=2) + "\n")
         return True
     except Exception as e:  # noqa: BLE001
         print("!! 状态文件写失败：%s" % e, file=sys.stderr)
@@ -156,25 +203,15 @@ def write_provider(cfg, text: str, dry: bool = False) -> tuple[bool, str]:
     if dry:
         return True, "（dry-run 未写）"
     try:
-        os.makedirs(os.path.dirname(pf) or ".", exist_ok=True)
-        if os.path.exists(pf):
-            bak = "%s.bak-%s" % (pf, time.strftime("%Y%m%d_%H%M%S"))
-            with open(pf, "rb") as src, open(bak, "wb") as dst:
-                dst.write(src.read())
-            _prune_backups(pf, cfg.aggregation["legs"]["backup_keep"])
-        tmp = pf + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, pf)
+        with _cc.file_lock(pf):
+            if os.path.exists(pf):
+                bak = _cc.backup_name(pf)
+                with open(pf, "rb") as src, open(bak, "wb") as dst:
+                    dst.write(src.read())
+                _prune_backups(pf, cfg.aggregation["legs"]["backup_keep"])
+            _cc.write_atomic(pf, text, newline="\n")
         return True, "已写 %s" % pf
     except Exception as e:  # noqa: BLE001
-        try:
-            if os.path.exists(pf + ".tmp"):
-                os.remove(pf + ".tmp")
-        except Exception:
-            pass
         return False, "写失败：%s" % e
 
 
@@ -274,8 +311,15 @@ def _need_legs(cfg) -> str:
 
 
 def apply_exclusions(cfg, excluded, dry=False, reload=True, quiet=False,
-                     last_action="") -> int:
-    """按剔除集合重渲染 provider_file 并热更新（成功后自动记状态）。返回退出码。"""
+                     last_action="", strict_leg=None, prune=False) -> int:
+    """按剔除集合重渲染 provider_file 并热更新（成功后自动记状态）。返回退出码。
+
+    strict_leg：本次用户**显式指定**的那条腿。只有它不存在于母本时才报错（退出码 3）——
+    剔除集合里那些「母本里已经没有了」的旧名字只告警并忽略，否则一次改动母本就会让
+    off/sync 全部卡在退出码 3，只能手工 `on <已消失的腿>` 才解得开。
+
+    prune：把剔除集合里已消失的名字一并从状态文件里清掉（sync 用）。
+    """
     _need_legs(cfg)
     full_text, warn = read_full(cfg)
     try:
@@ -288,22 +332,27 @@ def apply_exclusions(cfg, excluded, dry=False, reload=True, quiet=False,
         print("!! 母本里没有解析出任何腿（检查 %s 的格式）"
               % cfg.aggregation["legs"]["full_file"], file=sys.stderr)
         return RC_LEGS
-    unknown = sorted(set(excluded) - set(names))
-    if unknown:
-        print("!! 母本里没有这些腿：%s\n   现有腿：%s"
-              % (", ".join(unknown), ", ".join(names)), file=sys.stderr)
+    ex = set(excluded)
+    unknown = sorted(ex - set(names))
+    if strict_leg and strict_leg in unknown:
+        print("!! 母本里没有这条腿：%s\n   现有腿：%s"
+              % (strict_leg, ", ".join(names)), file=sys.stderr)
         return RC_LEGS
+    if unknown:
+        print("!! 剔除集合里有母本中已不存在的腿：%s（本次忽略；`sync` 会从状态里清掉）"
+              % ", ".join(unknown), file=sys.stderr)
+    effective = ex - set(unknown)
     keep_min = cfg.aggregation["legs"]["keep_min"]
-    if keep_min and len(names) - len(set(excluded)) < keep_min:
+    if keep_min and len(names) - len(effective) < keep_min:
         print("!! keep_min 保护：现有 %d 条腿、剔除 %d 条，将少于下限 %d 条，已放弃"
-              % (len(names), len(set(excluded)), keep_min), file=sys.stderr)
+              % (len(names), len(effective), keep_min), file=sys.stderr)
         return RC_KEEP
-    text = render_legs(full_text, excluded)
-    kept = [n for n in names if n not in set(excluded)]
+    text = render_legs(full_text, effective)
+    kept = [n for n in names if n not in effective]
     if not quiet:
         print("腿总数 %d → 生效 %d%s" % (len(names), len(kept),
-                                        ("（剔除：%s）" % ", ".join(sorted(excluded)))
-                                        if excluded else "（全部生效）"))
+                                        ("（剔除：%s）" % ", ".join(sorted(effective)))
+                                        if effective else "（全部生效）"))
     ok, msg = write_provider(cfg, text, dry)
     print("  写 provider：%s" % msg)
     if not ok:
@@ -311,7 +360,7 @@ def apply_exclusions(cfg, excluded, dry=False, reload=True, quiet=False,
     if not dry:
         # 文件已改成功 → 立刻记状态（即使随后热更新失败，状态也与文件一致）
         st = load_state(cfg)
-        st["excluded"] = sorted(set(excluded))
+        st["excluded"] = sorted(effective if prune else ex)
         if last_action:
             st["last_action"] = last_action
         if warn:
@@ -362,11 +411,12 @@ def cmd_off(cfg, leg, reason="", dry=False, reload=True) -> int:
         print("腿 %s 已在剔除集合里（幂等：不重复写）" % leg)
         return RC_OK
     ex.add(leg)
-    return apply_exclusions(cfg, ex, dry=dry, reload=reload,
+    return apply_exclusions(cfg, ex, dry=dry, reload=reload, strict_leg=leg,
                             last_action="off %s%s" % (leg, ("（%s）" % reason) if reason else ""))
 
 
 def cmd_on(cfg, leg, dry=False, reload=True) -> int:
+    # 放腿不需要 strict：把名字移出剔除集合永远安全，也是「清掉已消失的腿」的入口
     ex = set(load_state(cfg).get("excluded") or [])
     if leg not in ex:
         print("腿 %s 不在剔除集合里（幂等：不重复写）" % leg)
@@ -392,7 +442,7 @@ def cmd_sync(cfg, from_breaker=False, dry=False, reload=True) -> int:
         print("从控制台熔断态同步：tripped=%s → 剔除 %s" % (sorted(tripped), sorted(ex)))
     else:
         ex = set(st.get("excluded") or [])
-    return apply_exclusions(cfg, ex, dry=dry, reload=reload,
+    return apply_exclusions(cfg, ex, dry=dry, reload=reload, prune=True,
                             last_action="sync%s" % (" --from-breaker" if from_breaker else ""))
 
 
@@ -450,20 +500,37 @@ def main(argv=None) -> int:
         print("配置错误：%s" % e, file=sys.stderr)
         return RC_CFG
 
+    if args.cmd == "off":
+        def _do():
+            return cmd_off(cfg, args.leg, args.reason, args.dry_run, not args.no_reload)
+    elif args.cmd == "on":
+        def _do():
+            return cmd_on(cfg, args.leg, args.dry_run, not args.no_reload)
+    elif args.cmd == "sync":
+        def _do():
+            return cmd_sync(cfg, args.from_breaker, args.dry_run, not args.no_reload)
+    elif args.cmd == "list":
+        def _do():
+            return cmd_list(cfg, args.dry_run)
+    elif args.cmd == "status":
+        def _do():
+            return cmd_status(cfg)
+    else:
+        ap.print_help()
+        return RC_CFG
+
     try:
-        if args.cmd == "off":
-            rc = cmd_off(cfg, args.leg, args.reason, args.dry_run, not args.no_reload)
-        elif args.cmd == "on":
-            rc = cmd_on(cfg, args.leg, args.dry_run, not args.no_reload)
-        elif args.cmd == "sync":
-            rc = cmd_sync(cfg, args.from_breaker, args.dry_run, not args.no_reload)
-        elif args.cmd == "list":
-            rc = cmd_list(cfg, args.dry_run)
-        elif args.cmd == "status":
-            rc = cmd_status(cfg)
+        if args.json:
+            # --json 时把过程输出整体改道 stderr：否则 `leg_ctl.py --json list` 的 stdout
+            # 里混着人读的行，调用方 json.loads 直接失败（脚本拿不到结果）。
+            _real = sys.stdout
+            try:
+                sys.stdout = sys.stderr
+                rc = _do()
+            finally:
+                sys.stdout = _real
         else:
-            ap.print_help()
-            return RC_CFG
+            rc = _do()
     except (ConfigError, OSError, ValueError) as e:
         print("!! %s" % e, file=sys.stderr)
         return RC_CFG if isinstance(e, ConfigError) else RC_LEGS
